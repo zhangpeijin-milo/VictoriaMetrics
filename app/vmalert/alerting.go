@@ -62,17 +62,18 @@ type alertingRuleMetrics struct {
 
 func newAlertingRule(qb datasource.QuerierBuilder, group *Group, cfg config.Rule) *AlertingRule {
 	ar := &AlertingRule{
-		Type:         group.Type,
-		RuleID:       cfg.ID,
-		Name:         cfg.Alert,
-		Expr:         cfg.Expr,
-		For:          cfg.For.Duration(),
-		Labels:       cfg.Labels,
-		Annotations:  cfg.Annotations,
-		GroupID:      group.ID(),
-		GroupName:    group.Name,
-		EvalInterval: group.Interval,
-		Debug:        cfg.Debug,
+		Type:           group.Type,
+		RuleID:         cfg.ID,
+		Name:           cfg.Alert,
+		Expr:           cfg.Expr,
+		For:            cfg.For.Duration(),
+		Labels:         cfg.Labels,
+		Annotations:    cfg.Annotations,
+		GroupID:        group.ID(),
+		GroupName:      group.Name,
+		GroupAuthToken: group.AuthToken,
+		EvalInterval:   group.Interval,
+		Debug:          cfg.Debug,
 		q: qb.BuildWithParams(datasource.QuerierParams{
 			DataSourceType:     group.Type.String(),
 			EvaluationInterval: group.Interval,
@@ -284,6 +285,7 @@ const resolvedRetention = 15 * time.Minute
 // Based on the Querier results AlertingRule maintains notifier.Alerts
 func (ar *AlertingRule) Exec(ctx context.Context, ts time.Time, limit int) ([]prompbmarshal.TimeSeries, error) {
 	start := time.Now()
+	logger.Infof("AlertingRule.Exec ar.GroupAuthToken = %s", ar.GroupAuthToken.String())
 	qMetrics, req, err := ar.q.Query(ctx, ar.GroupAuthToken, ar.Expr, ts)
 	curState := ruleStateEntry{
 		time:     start,

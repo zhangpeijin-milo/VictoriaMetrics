@@ -3,6 +3,7 @@ package utils
 import (
 	"fmt"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"strconv"
 	"strings"
 )
@@ -31,7 +32,7 @@ func ParseURL(s string) (string, string, *auth.Token, error) {
 	prefix := s[:n]
 	s = s[n+1:]
 	baseURL := fmt.Sprintf("%s://%s/%s", scheme, host, prefix)
-
+	logger.Infof("ParseURL baseURL=%s", baseURL)
 	// find auth token and suffix
 	var accountID uint32 = 0
 	var projectID uint32 = 0
@@ -77,6 +78,8 @@ func ParseURL(s string) (string, string, *auth.Token, error) {
 		AccountID: accountID,
 		ProjectID: projectID,
 	}
+	logger.Infof("ParseURL Token=%s", at.String())
+	logger.Infof("ParseURL suffix=%s", suffix)
 
 	return baseURL, suffix, &at, nil
 }

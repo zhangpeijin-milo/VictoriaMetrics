@@ -90,6 +90,8 @@ func mergeLabels(groupName, ruleName string, set1, set2 map[string]string) map[s
 }
 
 func newGroup(cfg config.Group, qb datasource.QuerierBuilder, defaultInterval time.Duration, labels map[string]string) *Group {
+	logger.Infof(fmt.Sprintf("newGroup cfg.Tenant=%s", cfg.Tenant))
+
 	g := &Group{
 		Type:        cfg.Type,
 		Name:        cfg.Name,
@@ -106,11 +108,10 @@ func newGroup(cfg config.Group, qb datasource.QuerierBuilder, defaultInterval ti
 		finishedCh: make(chan struct{}),
 		updateCh:   make(chan *Group),
 	}
-	if cfg.Tenant != nil {
-		g.AuthToken = &auth.Token{
-			AccountID: cfg.Tenant.AccountID,
-			ProjectID: cfg.Tenant.ProjectID,
-		}
+	if len(cfg.Tenant) > 0 {
+		t := &auth.Token{}
+		t.Init(cfg.Tenant)
+		g.AuthToken = t
 	} else {
 		g.AuthToken = datasource.DefaultAuthToken
 	}

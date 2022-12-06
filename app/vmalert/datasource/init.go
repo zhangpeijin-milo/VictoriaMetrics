@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"net/http"
 	"net/url"
 	"time"
@@ -82,6 +83,8 @@ func Init(extraParams url.Values) (QuerierBuilder, error) {
 	BaseURL, Suffix, DefaultAuthToken, err = utils.ParseURL(*addr)
 	if err != nil {
 		return nil, fmt.Errorf("wrong format of datasource.url: %v", *addr)
+	} else {
+		logger.Infof("DEBUG BaseURL = %s, Suffix = %s, DefaultAuthToken = [%d:%d]", BaseURL, Suffix, DefaultAuthToken.AccountID, DefaultAuthToken.ProjectID)
 	}
 
 	tr, err := utils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)

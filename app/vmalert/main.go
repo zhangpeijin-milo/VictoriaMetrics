@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"gopkg.in/yaml.v2"
 	"net/url"
 	"os"
 	"strconv"
@@ -155,6 +156,11 @@ func main() {
 	if err != nil {
 		logger.Fatalf("cannot parse configuration file: %s", err)
 	}
+	content, err := yaml.Marshal(groupsCfg)
+	if err != nil {
+		logger.Fatalf("cannot marshal configuration file: %s", err)
+	}
+	logger.Infof("groupsCfg content is %v", string(content))
 
 	// Register SIGHUP handler for config re-read just before manager.start call.
 	// This guarantees that the config will be re-read if the signal arrives during manager.start call.
@@ -355,7 +361,8 @@ func configReload(ctx context.Context, m *manager, groupsCfg []config.Group, sig
 		groupsCfg = newGroupsCfg
 		configSuccess.Set(1)
 		configTimestamp.Set(fasttime.UnixTimestamp())
-		logger.Infof("Rules reloaded successfully from %q", *rulePath)
+		content, err := yaml.Marshal(groupsCfg)
+		logger.Infof("Rules reloaded successfully from %q, content = ", *rulePath, content)
 	}
 }
 

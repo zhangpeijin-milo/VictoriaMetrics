@@ -180,7 +180,7 @@ func (s *VMStorage) do(ctx context.Context, req *http.Request) (*http.Response, 
 
 func (s *VMStorage) newRequestPOST(at *auth.Token) (*http.Request, error) {
 	// todo zhangpeijin
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s/", BaseURL, at.String()), nil)
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s/%s", BaseURL, at.String(), Suffix), nil)
 	if err != nil {
 		return nil, err
 	}
