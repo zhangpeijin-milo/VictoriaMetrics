@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"hash/fnv"
 	"net/url"
 	"strconv"
@@ -32,6 +33,7 @@ type Group struct {
 	Interval       time.Duration
 	Limit          int
 	Concurrency    int
+	AuthToken      *auth.Token
 	Checksum       string
 	LastEvaluation time.Time
 
@@ -104,6 +106,15 @@ func newGroup(cfg config.Group, qb datasource.QuerierBuilder, defaultInterval ti
 		finishedCh: make(chan struct{}),
 		updateCh:   make(chan *Group),
 	}
+	if cfg.Tenant != nil {
+		g.AuthToken = &auth.Token{
+			AccountID: cfg.Tenant.AccountID,
+			ProjectID: cfg.Tenant.ProjectID,
+		}
+	} else {
+		g.AuthToken = datasource.DefaultAuthToken
+	}
+
 	if g.Interval == 0 {
 		g.Interval = defaultInterval
 	}
@@ -154,6 +165,8 @@ func (g *Group) ID() uint64 {
 	hash.Write([]byte("\xff"))
 	hash.Write([]byte(g.Name))
 	hash.Write([]byte(g.Type.Get()))
+	hash.Write([]byte("\xff"))
+	hash.Write([]byte(g.AuthToken.String()))
 	return hash.Sum64()
 }
 
@@ -171,7 +184,7 @@ func (g *Group) Restore(ctx context.Context, qb datasource.QuerierBuilder, lookb
 		// ignore g.ExtraFilterLabels on purpose, so it
 		// won't affect the restore procedure.
 		q := qb.BuildWithParams(datasource.QuerierParams{})
-		if err := rr.Restore(ctx, q, lookback, labels); err != nil {
+		if err := rr.Restore(ctx, g.AuthToken, q, lookback, labels); err != nil {
 			return fmt.Errorf("error while restoring rule %q: %w", rule, err)
 		}
 	}
@@ -221,6 +234,7 @@ func (g *Group) updateWith(newGroup *Group) error {
 	// group.Start function
 	g.Type = newGroup.Type
 	g.Concurrency = newGroup.Concurrency
+	g.AuthToken = newGroup.AuthToken
 	g.Params = newGroup.Params
 	g.Headers = newGroup.Headers
 	g.Labels = newGroup.Labels
@@ -423,7 +437,7 @@ func (e *executor) exec(ctx context.Context, rule Rule, ts time.Time, resolveDur
 		pushToRW := func(tss []prompbmarshal.TimeSeries) {
 			for _, ts := range tss {
 				remoteWriteTotal.Inc()
-				if err := e.rw.Push(ts); err != nil {
+				if err := e.rw.Push(rule.AuthToken(), ts); err != nil {
 					remoteWriteErrors.Inc()
 					errGr.Add(fmt.Errorf("rule %q: remote write failure: %w", rule, err))
 				}

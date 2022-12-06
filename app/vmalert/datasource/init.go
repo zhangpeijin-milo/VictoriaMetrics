@@ -3,9 +3,9 @@ package datasource
 import (
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
@@ -53,6 +53,9 @@ var (
 		`If true, disables HTTP keep-alives and will only use the connection to the server for a single HTTP request.`)
 	roundDigits = flag.Int("datasource.roundDigits", 0, `Adds "round_digits" GET param to datasource requests. `+
 		`In VM "round_digits" limits the number of digits after the decimal point in response values.`)
+	Suffix           string
+	BaseURL          string
+	DefaultAuthToken *auth.Token
 )
 
 // InitSecretFlags must be called after flag.Parse and before any logging
@@ -73,6 +76,12 @@ type Param struct {
 func Init(extraParams url.Values) (QuerierBuilder, error) {
 	if *addr == "" {
 		return nil, fmt.Errorf("datasource.url is empty")
+	}
+
+	var err error
+	BaseURL, Suffix, DefaultAuthToken, err = utils.ParseURL(*addr)
+	if err != nil {
+		return nil, fmt.Errorf("wrong format of datasource.url: %v", *addr)
 	}
 
 	tr, err := utils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
@@ -104,7 +113,8 @@ func Init(extraParams url.Values) (QuerierBuilder, error) {
 	return &VMStorage{
 		c:                &http.Client{Transport: tr},
 		authCfg:          authCfg,
-		datasourceURL:    strings.TrimSuffix(*addr, "/"),
+		baseURL:          BaseURL,
+		suffix:           Suffix,
 		appendTypePrefix: *appendTypePrefix,
 		lookBack:         *lookBack,
 		queryStep:        *queryStep,

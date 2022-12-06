@@ -190,6 +190,13 @@ func (g *Group) toAPI() APIGroup {
 		Headers:        headersToStrings(g.Headers),
 		Labels:         g.Labels,
 	}
+	ag.AuthToken = nil
+	if g.AuthToken != nil {
+		ag.AuthToken = &APIAuthToken{
+			AccountID: g.AuthToken.AccountID,
+			ProjectID: g.AuthToken.ProjectID,
+		}
+	}
 	for _, r := range g.Rules {
 		ag.Rules = append(ag.Rules, r.ToAPI())
 	}

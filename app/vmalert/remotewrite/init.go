@@ -77,7 +77,9 @@ func Init(ctx context.Context) (*Client, error) {
 	}
 
 	return NewClient(ctx, Config{
-		Addr:              *addr,
+		URL:               *addr,
+		BaseURL:           "",
+		Suffix:            "",
 		AuthCfg:           authCfg,
 		Concurrency:       *concurrency,
 		MaxQueueSize:      *maxQueueSize,

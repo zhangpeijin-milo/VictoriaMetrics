@@ -5,10 +5,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"io"
 	"net/http"
 	"path"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,10 +27,12 @@ var (
 // Client is an asynchronous HTTP client for writing
 // timeseries via remote write protocol.
 type Client struct {
-	addr          string
+	URL           string
+	baseURL       string
+	suffix        string
 	c             *http.Client
 	authCfg       *promauth.Config
-	input         chan prompbmarshal.TimeSeries
+	tswCh         chan TimeseriesWrapper
 	flushInterval time.Duration
 	maxBatchSize  int
 	maxQueueSize  int
@@ -38,11 +40,39 @@ type Client struct {
 	wg     sync.WaitGroup
 	doneCh chan struct{}
 }
+type TimeseriesWrapper struct {
+	at string
+	ts prompbmarshal.TimeSeries
+}
+
+type WriteRequestWrapper struct {
+	m       map[string]*prompbmarshal.WriteRequest
+	tsCount int
+}
+
+func (w *WriteRequestWrapper) AddTimeseries(tsw TimeseriesWrapper) {
+	tss, ok := w.m[tsw.at]
+	if !ok {
+		tss = &prompbmarshal.WriteRequest{}
+	}
+	tss.Timeseries = append(tss.Timeseries, tsw.ts)
+	w.m[tsw.at] = tss
+	w.tsCount += 1
+}
+
+func (w *WriteRequestWrapper) Reset() {
+	for _, wr := range w.m {
+		prompbmarshal.ResetWriteRequest(wr)
+	}
+	w.tsCount = 0
+}
 
 // Config is config for remote write.
 type Config struct {
-	// Addr of remote storage
-	Addr    string
+	URL     string
+	BaseURL string
+	Suffix  string
+
 	AuthCfg *promauth.Config
 
 	// Concurrency defines number of readers that
@@ -77,9 +107,10 @@ const (
 // NewClient returns asynchronous client for
 // writing timeseries via remotewrite protocol.
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
-	if cfg.Addr == "" {
+	if cfg.BaseURL == "" && cfg.URL == "" {
 		return nil, fmt.Errorf("config.Addr can't be empty")
 	}
+
 	if cfg.MaxBatchSize == 0 {
 		cfg.MaxBatchSize = defaultMaxBatchSize
 	}
@@ -104,13 +135,17 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 			Timeout:   cfg.WriteTimeout,
 			Transport: cfg.Transport,
 		},
-		addr:          strings.TrimSuffix(cfg.Addr, "/"),
+		baseURL:       cfg.BaseURL,
+		suffix:        cfg.Suffix,
 		authCfg:       cfg.AuthCfg,
 		flushInterval: cfg.FlushInterval,
 		maxBatchSize:  cfg.MaxBatchSize,
 		maxQueueSize:  cfg.MaxQueueSize,
 		doneCh:        make(chan struct{}),
-		input:         make(chan prompbmarshal.TimeSeries, cfg.MaxQueueSize),
+		tswCh:         make(chan TimeseriesWrapper, cfg.MaxQueueSize),
+	}
+	if cfg.URL != "" {
+		c.URL = cfg.URL
 	}
 
 	for i := 0; i < cc; i++ {
@@ -121,11 +156,11 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 
 // Push adds timeseries into queue for writing into remote storage.
 // Push returns and error if client is stopped or if queue is full.
-func (c *Client) Push(s prompbmarshal.TimeSeries) error {
+func (c *Client) Push(at *auth.Token, s prompbmarshal.TimeSeries) error {
 	select {
 	case <-c.doneCh:
 		return fmt.Errorf("client is closed")
-	case c.input <- s:
+	case c.tswCh <- TimeseriesWrapper{at.String(), s}:
 		return nil
 	default:
 		return fmt.Errorf("failed to push timeseries - queue is full (%d entries). "+
@@ -140,7 +175,7 @@ func (c *Client) Close() error {
 	if c.doneCh == nil {
 		return fmt.Errorf("client is already closed")
 	}
-	close(c.input)
+	close(c.tswCh)
 	close(c.doneCh)
 	c.wg.Wait()
 	return nil
@@ -148,13 +183,15 @@ func (c *Client) Close() error {
 
 func (c *Client) run(ctx context.Context) {
 	ticker := time.NewTicker(c.flushInterval)
-	wr := &prompbmarshal.WriteRequest{}
+	wrw := &WriteRequestWrapper{
+		m: make(map[string]*prompbmarshal.WriteRequest),
+	}
 	shutdown := func() {
-		for ts := range c.input {
-			wr.Timeseries = append(wr.Timeseries, ts)
+		for tsw := range c.tswCh {
+			wrw.AddTimeseries(tsw)
 		}
 		lastCtx, cancel := context.WithTimeout(context.Background(), defaultWriteTimeout)
-		c.flush(lastCtx, wr)
+		c.flush(lastCtx, wrw)
 		cancel()
 	}
 	c.wg.Add(1)
@@ -170,14 +207,14 @@ func (c *Client) run(ctx context.Context) {
 				shutdown()
 				return
 			case <-ticker.C:
-				c.flush(ctx, wr)
-			case ts, ok := <-c.input:
+				c.flush(ctx, wrw)
+			case tsw, ok := <-c.tswCh:
 				if !ok {
 					continue
 				}
-				wr.Timeseries = append(wr.Timeseries, ts)
-				if len(wr.Timeseries) >= c.maxBatchSize {
-					c.flush(ctx, wr)
+				wrw.AddTimeseries(tsw)
+				if wrw.tsCount >= c.maxBatchSize {
+					c.flush(ctx, wrw)
 				}
 			}
 		}
@@ -195,44 +232,53 @@ var (
 // flush is a blocking function that marshals WriteRequest and sends
 // it to remote write endpoint. Flush performs limited amount of retries
 // if request fails.
-func (c *Client) flush(ctx context.Context, wr *prompbmarshal.WriteRequest) {
-	if len(wr.Timeseries) < 1 {
+func (c *Client) flush(ctx context.Context, wrw *WriteRequestWrapper) {
+	if wrw.tsCount < 1 {
 		return
 	}
-	defer prompbmarshal.ResetWriteRequest(wr)
+	defer wrw.Reset()
 	defer bufferFlushDuration.UpdateDuration(time.Now())
 
-	data, err := wr.Marshal()
-	if err != nil {
-		logger.Errorf("failed to marshal WriteRequest: %s", err)
-		return
-	}
-
-	const attempts = 5
-	b := snappy.Encode(nil, data)
-	for i := 0; i < attempts; i++ {
-		err := c.send(ctx, b)
-		if err == nil {
-			sentRows.Add(len(wr.Timeseries))
-			sentBytes.Add(len(b))
+	for at, wr := range wrw.m {
+		data, err := wr.Marshal()
+		if err != nil {
+			logger.Errorf("failed to marshal WriteRequest: %s", err)
 			return
 		}
+		const attempts = 5
+		b := snappy.Encode(nil, data)
+		for i := 0; i < attempts; i++ {
+			err := c.send(ctx, at, b)
+			if err == nil {
+				sentRows.Add(len(wr.Timeseries))
+				sentBytes.Add(len(b))
+				return
+			}
 
-		logger.Warnf("attempt %d to send request failed: %s", i+1, err)
-		// sleeping to avoid remote db hammering
-		time.Sleep(time.Second)
-		continue
+			logger.Errorf("attempt %d to send request failed: %s", i+1, err)
+			// sleeping to avoid remote db hammering
+			time.Sleep(time.Second)
+			continue
+		}
+		droppedRows.Add(len(wr.Timeseries))
+		droppedBytes.Add(len(b))
+		logger.Errorf("all %d attempts to send request failed - dropping %d timeseries",
+			attempts, len(wr.Timeseries))
 	}
-
-	droppedRows.Add(len(wr.Timeseries))
-	droppedBytes.Add(len(b))
-	logger.Errorf("all %d attempts to send request failed - dropping %d time series",
-		attempts, len(wr.Timeseries))
 }
 
-func (c *Client) send(ctx context.Context, data []byte) error {
+var writePath = "/api/v1/write"
+
+func (c *Client) send(ctx context.Context, at string, data []byte) error {
 	r := bytes.NewReader(data)
-	req, err := http.NewRequest("POST", c.addr, r)
+	var addr string
+	if c.URL == "" {
+		addr = fmt.Sprintf("%v/%s/%s%s", c.baseURL, at, c.suffix, writePath)
+	} else {
+		addr = fmt.Sprintf("%v%s", c.URL, writePath)
+	}
+	req, err := http.NewRequest("POST", addr, r)
+
 	if err != nil {
 		return fmt.Errorf("failed to create new HTTP request: %w", err)
 	}
@@ -247,8 +293,9 @@ func (c *Client) send(ctx context.Context, data []byte) error {
 	if c.authCfg != nil {
 		c.authCfg.SetHeaders(req, true)
 	}
+	// todo zhangpeijin
 	if !*disablePathAppend {
-		req.URL.Path = path.Join(req.URL.Path, "/api/v1/write")
+		req.URL.Path = path.Join(req.URL.Path, writePath)
 	}
 	resp, err := c.c.Do(req.WithContext(ctx))
 	if err != nil {

@@ -74,6 +74,13 @@ type APIGroup struct {
 	Headers []string `json:"headers,omitempty"`
 	// Labels is a set of label value pairs, that will be added to every rule.
 	Labels map[string]string `json:"labels,omitempty"`
+
+	AuthToken *APIAuthToken `json:"auth_token"`
+}
+
+type APIAuthToken struct {
+	AccountID uint32 `json:"account_id"`
+	ProjectID uint32 `json:"project_id"`
 }
 
 // GroupAlerts represents a group of alerts for WEB view

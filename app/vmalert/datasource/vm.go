@@ -3,10 +3,10 @@ package datasource
 import (
 	"context"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -29,9 +29,12 @@ func toDatasourceType(s string) datasourceType {
 
 // VMStorage represents vmstorage entity with ability to read and write metrics
 type VMStorage struct {
-	c                *http.Client
-	authCfg          *promauth.Config
-	datasourceURL    string
+	c       *http.Client
+	authCfg *promauth.Config
+
+	baseURL string
+	suffix  string
+
 	appendTypePrefix bool
 	lookBack         time.Duration
 	queryStep        time.Duration
@@ -56,7 +59,8 @@ func (s *VMStorage) Clone() *VMStorage {
 	return &VMStorage{
 		c:                s.c,
 		authCfg:          s.authCfg,
-		datasourceURL:    s.datasourceURL,
+		baseURL:          s.baseURL,
+		suffix:           s.suffix,
 		lookBack:         s.lookBack,
 		queryStep:        s.queryStep,
 		appendTypePrefix: s.appendTypePrefix,
@@ -85,11 +89,12 @@ func (s *VMStorage) BuildWithParams(params QuerierParams) Querier {
 }
 
 // NewVMStorage is a constructor for VMStorage
-func NewVMStorage(baseURL string, authCfg *promauth.Config, lookBack time.Duration, queryStep time.Duration, appendTypePrefix bool, c *http.Client) *VMStorage {
+func NewVMStorage(baseURL, suffix string, authCfg *promauth.Config, lookBack time.Duration, queryStep time.Duration, appendTypePrefix bool, c *http.Client) *VMStorage {
 	return &VMStorage{
 		c:                c,
 		authCfg:          authCfg,
-		datasourceURL:    strings.TrimSuffix(baseURL, "/"),
+		baseURL:          baseURL,
+		suffix:           suffix,
 		appendTypePrefix: appendTypePrefix,
 		lookBack:         lookBack,
 		queryStep:        queryStep,
@@ -98,8 +103,8 @@ func NewVMStorage(baseURL string, authCfg *promauth.Config, lookBack time.Durati
 }
 
 // Query executes the given query and returns parsed response
-func (s *VMStorage) Query(ctx context.Context, query string, ts time.Time) ([]Metric, *http.Request, error) {
-	req, err := s.newRequestPOST()
+func (s *VMStorage) Query(ctx context.Context, at *auth.Token, query string, ts time.Time) ([]Metric, *http.Request, error) {
+	req, err := s.newRequestPOST(at)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -132,11 +137,11 @@ func (s *VMStorage) Query(ctx context.Context, query string, ts time.Time) ([]Me
 // QueryRange executes the given query on the given time range.
 // For Prometheus type see https://prometheus.io/docs/prometheus/latest/querying/api/#range-queries
 // Graphite type isn't supported.
-func (s *VMStorage) QueryRange(ctx context.Context, query string, start, end time.Time) ([]Metric, error) {
+func (s *VMStorage) QueryRange(ctx context.Context, at *auth.Token, query string, start, end time.Time) ([]Metric, error) {
 	if s.dataSourceType != datasourcePrometheus {
 		return nil, fmt.Errorf("%q is not supported for QueryRange", s.dataSourceType)
 	}
-	req, err := s.newRequestPOST()
+	req, err := s.newRequestPOST(at)
 	if err != nil {
 		return nil, err
 	}
@@ -173,8 +178,9 @@ func (s *VMStorage) do(ctx context.Context, req *http.Request) (*http.Response, 
 	return resp, nil
 }
 
-func (s *VMStorage) newRequestPOST() (*http.Request, error) {
-	req, err := http.NewRequest("POST", s.datasourceURL, nil)
+func (s *VMStorage) newRequestPOST(at *auth.Token) (*http.Request, error) {
+	// todo zhangpeijin
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s/", BaseURL, at.String()), nil)
 	if err != nil {
 		return nil, err
 	}

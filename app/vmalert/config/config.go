@@ -28,6 +28,7 @@ type Group struct {
 	Limit       int                 `yaml:"limit,omitempty"`
 	Rules       []Rule              `yaml:"rules"`
 	Concurrency int                 `yaml:"concurrency"`
+	Tenant      *Tenant             `yaml:"tenant,omitempty"`
 	// Labels is a set of label value pairs, that will be added to every rule.
 	// It has priority over the external labels.
 	Labels map[string]string `yaml:"labels"`
@@ -41,6 +42,11 @@ type Group struct {
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
+}
+
+type Tenant struct {
+	AccountID uint32 `yaml:"accountID"`
+	ProjectID uint32 `yaml:"projectID,omitempty"`
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.

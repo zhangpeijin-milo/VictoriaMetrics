@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"net/http"
 	"sync"
 	"time"
@@ -30,6 +31,8 @@ type Rule interface {
 	// Close performs the shutdown procedures for rule
 	// such as metrics unregister
 	Close()
+	// AuthToken returns the auth token of the rule
+	AuthToken() *auth.Token
 }
 
 var errDuplicate = errors.New("result contains metrics with the same labelset after applying rule labels")

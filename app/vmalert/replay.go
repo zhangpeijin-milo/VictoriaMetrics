@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"strings"
 	"time"
 
@@ -100,7 +101,7 @@ func (g *Group) replay(start, end time.Time, rw *remotewrite.Client) int {
 		}
 		ri.reset()
 		for ri.next() {
-			n, err := replayRule(rule, ri.s, ri.e, rw)
+			n, err := replayRule(g.AuthToken, rule, ri.s, ri.e, rw)
 			if err != nil {
 				logger.Fatalf("rule %q: %s", rule, err)
 			}
@@ -119,7 +120,7 @@ func (g *Group) replay(start, end time.Time, rw *remotewrite.Client) int {
 	return total
 }
 
-func replayRule(rule Rule, start, end time.Time, rw *remotewrite.Client) (int, error) {
+func replayRule(token *auth.Token, rule Rule, start, end time.Time, rw *remotewrite.Client) (int, error) {
 	var err error
 	var tss []prompbmarshal.TimeSeries
 	for i := 0; i < *replayRuleRetryAttempts; i++ {
@@ -138,7 +139,7 @@ func replayRule(rule Rule, start, end time.Time, rw *remotewrite.Client) (int, e
 	}
 	var n int
 	for _, ts := range tss {
-		if err := rw.Push(ts); err != nil {
+		if err := rw.Push(token, ts); err != nil {
 			return n, fmt.Errorf("remote write failure: %s", err)
 		}
 		n += len(ts.Samples)

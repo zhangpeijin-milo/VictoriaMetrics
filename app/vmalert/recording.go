@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"sort"
 	"strings"
 	"time"
@@ -17,12 +18,13 @@ import (
 // to evaluate configured Expression and
 // return TimeSeries as result.
 type RecordingRule struct {
-	Type    config.Type
-	RuleID  uint64
-	Name    string
-	Expr    string
-	Labels  map[string]string
-	GroupID uint64
+	Type           config.Type
+	RuleID         uint64
+	Name           string
+	Expr           string
+	Labels         map[string]string
+	GroupID        uint64
+	GroupAuthToken *auth.Token
 
 	q datasource.Querier
 
@@ -43,6 +45,11 @@ func (rr *RecordingRule) String() string {
 	return rr.Name
 }
 
+// AuthToken returns the auth token of the recording rule
+func (rr *RecordingRule) AuthToken() *auth.Token {
+	return rr.GroupAuthToken
+}
+
 // ID returns unique Rule ID
 // within the parent Group.
 func (rr *RecordingRule) ID() uint64 {
@@ -51,14 +58,15 @@ func (rr *RecordingRule) ID() uint64 {
 
 func newRecordingRule(qb datasource.QuerierBuilder, group *Group, cfg config.Rule) *RecordingRule {
 	rr := &RecordingRule{
-		Type:    group.Type,
-		RuleID:  cfg.ID,
-		Name:    cfg.Record,
-		Expr:    cfg.Expr,
-		Labels:  cfg.Labels,
-		GroupID: group.ID(),
-		metrics: &recordingRuleMetrics{},
-		state:   newRuleState(),
+		Type:           group.Type,
+		RuleID:         cfg.ID,
+		Name:           cfg.Record,
+		Expr:           cfg.Expr,
+		Labels:         cfg.Labels,
+		GroupID:        group.ID(),
+		GroupAuthToken: group.AuthToken,
+		metrics:        &recordingRuleMetrics{},
+		state:          newRuleState(),
 		q: qb.BuildWithParams(datasource.QuerierParams{
 			DataSourceType:     group.Type.String(),
 			EvaluationInterval: group.Interval,
@@ -94,7 +102,7 @@ func (rr *RecordingRule) Close() {
 // It doesn't update internal states of the Rule and meant to be used just
 // to get time series for backfilling.
 func (rr *RecordingRule) ExecRange(ctx context.Context, start, end time.Time) ([]prompbmarshal.TimeSeries, error) {
-	series, err := rr.q.QueryRange(ctx, rr.Expr, start, end)
+	series, err := rr.q.QueryRange(ctx, rr.GroupAuthToken, rr.Expr, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +123,7 @@ func (rr *RecordingRule) ExecRange(ctx context.Context, start, end time.Time) ([
 // Exec executes RecordingRule expression via the given Querier.
 func (rr *RecordingRule) Exec(ctx context.Context, ts time.Time, limit int) ([]prompbmarshal.TimeSeries, error) {
 	start := time.Now()
-	qMetrics, req, err := rr.q.Query(ctx, rr.Expr, ts)
+	qMetrics, req, err := rr.q.Query(ctx, rr.GroupAuthToken, rr.Expr, ts)
 	curState := ruleStateEntry{
 		time:     start,
 		at:       ts,
