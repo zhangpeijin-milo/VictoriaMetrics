@@ -285,7 +285,6 @@ const resolvedRetention = 15 * time.Minute
 // Based on the Querier results AlertingRule maintains notifier.Alerts
 func (ar *AlertingRule) Exec(ctx context.Context, ts time.Time, limit int) ([]prompbmarshal.TimeSeries, error) {
 	start := time.Now()
-	logger.Infof("AlertingRule.Exec ar.GroupAuthToken = %s", ar.GroupAuthToken.String())
 	qMetrics, req, err := ar.q.Query(ctx, ar.GroupAuthToken, ar.Expr, ts)
 	curState := ruleStateEntry{
 		time:     start,

@@ -3,6 +3,8 @@ package remoteread
 import (
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"net/http"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
@@ -43,6 +45,10 @@ var (
 	oauth2ClientSecretFile = flag.String("remoteRead.oauth2.clientSecretFile", "", "Optional OAuth2 clientSecretFile to use for -remoteRead.url.")
 	oauth2TokenURL         = flag.String("remoteRead.oauth2.tokenUrl", "", "Optional OAuth2 tokenURL to use for -remoteRead.url. ")
 	oauth2Scopes           = flag.String("remoteRead.oauth2.scopes", "", "Optional OAuth2 scopes to use for -remoteRead.url. Scopes must be delimited by ';'.")
+
+	Suffix           string
+	BaseURL          string
+	DefaultAuthToken *auth.Token
 )
 
 // InitSecretFlags must be called after flag.Parse and before any logging
@@ -58,6 +64,15 @@ func Init() (datasource.QuerierBuilder, error) {
 	if *addr == "" {
 		return nil, nil
 	}
+
+	var err error
+	BaseURL, Suffix, DefaultAuthToken, err = utils.ParseURL(*addr)
+	if err != nil {
+		return nil, fmt.Errorf("wrong format of remoteread.url: %v", *addr)
+	} else {
+		logger.Infof("DEBUG BaseURL = %s, Suffix = %s, DefaultAuthToken = [%d:%d]", BaseURL, Suffix, DefaultAuthToken.AccountID, DefaultAuthToken.ProjectID)
+	}
+
 	tr, err := utils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create transport: %w", err)
@@ -72,5 +87,5 @@ func Init() (datasource.QuerierBuilder, error) {
 		return nil, fmt.Errorf("failed to configure auth: %w", err)
 	}
 	c := &http.Client{Transport: tr}
-	return datasource.NewVMStorage(*addr, "", authCfg, 0, 0, false, c), nil
+	return datasource.NewVMStorage(BaseURL, Suffix, authCfg, 0, 0, false, c), nil
 }

@@ -196,6 +196,7 @@ func (g *Group) toAPI() APIGroup {
 			AccountID: g.AuthToken.AccountID,
 			ProjectID: g.AuthToken.ProjectID,
 		}
+		logger.Infof("Group.toAPI ag.AuthToken=%s", g.AuthToken.String())
 	}
 	for _, r := range g.Rules {
 		ag.Rules = append(ag.Rules, r.ToAPI())

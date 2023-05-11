@@ -271,13 +271,8 @@ var writePath = "/api/v1/write"
 
 func (c *Client) send(ctx context.Context, at string, data []byte) error {
 	r := bytes.NewReader(data)
-	var addr string
-	if c.URL == "" {
-		addr = fmt.Sprintf("%v/%s/%s%s", c.baseURL, at, c.suffix, writePath)
-	} else {
-		addr = fmt.Sprintf("%v%s", c.URL, writePath)
-	}
-	req, err := http.NewRequest("POST", addr, r)
+	url := fmt.Sprintf("%s/%s/%s", BaseURL, at, Suffix)
+	req, err := http.NewRequest("POST", url, r)
 
 	if err != nil {
 		return fmt.Errorf("failed to create new HTTP request: %w", err)
@@ -293,10 +288,10 @@ func (c *Client) send(ctx context.Context, at string, data []byte) error {
 	if c.authCfg != nil {
 		c.authCfg.SetHeaders(req, true)
 	}
-	// todo zhangpeijin
 	if !*disablePathAppend {
 		req.URL.Path = path.Join(req.URL.Path, writePath)
 	}
+	logger.Infof("Client.send finalUrl = %s", req.URL.Path)
 	resp, err := c.c.Do(req.WithContext(ctx))
 	if err != nil {
 		return fmt.Errorf("error while sending request to %s: %w; Data len %d(%d)",

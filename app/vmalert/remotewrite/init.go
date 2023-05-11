@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
@@ -46,6 +48,10 @@ var (
 	oauth2ClientSecretFile = flag.String("remoteWrite.oauth2.clientSecretFile", "", "Optional OAuth2 clientSecretFile to use for -remoteWrite.url.")
 	oauth2TokenURL         = flag.String("remoteWrite.oauth2.tokenUrl", "", "Optional OAuth2 tokenURL to use for -notifier.url.")
 	oauth2Scopes           = flag.String("remoteWrite.oauth2.scopes", "", "Optional OAuth2 scopes to use for -notifier.url. Scopes must be delimited by ';'.")
+
+	Suffix           string
+	BaseURL          string
+	DefaultAuthToken *auth.Token
 )
 
 // InitSecretFlags must be called after flag.Parse and before any logging
@@ -60,6 +66,14 @@ func InitSecretFlags() {
 func Init(ctx context.Context) (*Client, error) {
 	if *addr == "" {
 		return nil, nil
+	}
+
+	var err error
+	BaseURL, Suffix, DefaultAuthToken, err = utils.ParseURL(*addr)
+	if err != nil {
+		return nil, fmt.Errorf("wrong format of remotewrite.url: %v", *addr)
+	} else {
+		logger.Infof("DEBUG BaseURL = %s, Suffix = %s, DefaultAuthToken = [%d:%d]", BaseURL, Suffix, DefaultAuthToken.AccountID, DefaultAuthToken.ProjectID)
 	}
 
 	t, err := utils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
@@ -78,8 +92,8 @@ func Init(ctx context.Context) (*Client, error) {
 
 	return NewClient(ctx, Config{
 		URL:               *addr,
-		BaseURL:           "",
-		Suffix:            "",
+		BaseURL:           BaseURL,
+		Suffix:            Suffix,
 		AuthCfg:           authCfg,
 		Concurrency:       *concurrency,
 		MaxQueueSize:      *maxQueueSize,

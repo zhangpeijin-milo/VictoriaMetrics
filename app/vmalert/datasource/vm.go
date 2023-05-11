@@ -118,6 +118,7 @@ func (s *VMStorage) Query(ctx context.Context, at *auth.Token, query string, ts 
 		return nil, nil, fmt.Errorf("engine not found: %q", s.dataSourceType)
 	}
 
+	logger.Infof("VMStorage.Query url=%s", req.URL)
 	resp, err := s.do(ctx, req)
 	if err != nil {
 		return nil, req, err
@@ -152,6 +153,8 @@ func (s *VMStorage) QueryRange(ctx context.Context, at *auth.Token, query string
 		return nil, fmt.Errorf("end param is missing")
 	}
 	s.setPrometheusRangeReqParams(req, query, start, end)
+	logger.Infof("VMStorage.QueryRange url=%s", req.URL)
+
 	resp, err := s.do(ctx, req)
 	if err != nil {
 		return nil, err
@@ -179,8 +182,8 @@ func (s *VMStorage) do(ctx context.Context, req *http.Request) (*http.Response, 
 }
 
 func (s *VMStorage) newRequestPOST(at *auth.Token) (*http.Request, error) {
-	// todo zhangpeijin
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s/%s", BaseURL, at.String(), Suffix), nil)
+	requestURL := fmt.Sprintf("%s/%s/%s", BaseURL, at.String(), Suffix)
+	req, err := http.NewRequest("POST", requestURL, nil)
 	if err != nil {
 		return nil, err
 	}

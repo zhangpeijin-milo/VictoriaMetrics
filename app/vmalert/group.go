@@ -440,6 +440,7 @@ func (e *executor) exec(ctx context.Context, rule Rule, ts time.Time, resolveDur
 				remoteWriteTotal.Inc()
 				if err := e.rw.Push(rule.AuthToken(), ts); err != nil {
 					remoteWriteErrors.Inc()
+					logger.Infof("executor.exec rule.AuthToken()=%s", rule.AuthToken())
 					errGr.Add(fmt.Errorf("rule %q: remote write failure: %w", rule, err))
 				}
 			}
