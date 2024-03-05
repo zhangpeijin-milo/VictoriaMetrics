@@ -118,7 +118,7 @@ func (s *VMStorage) Query(ctx context.Context, at *auth.Token, query string, ts 
 		return nil, nil, fmt.Errorf("engine not found: %q", s.dataSourceType)
 	}
 
-	logger.Infof("VMStorage.Query url=%s", req.URL)
+	//logger.Infof("VMStorage.Query url=%s", req.URL)
 	resp, err := s.do(ctx, req)
 	if err != nil {
 		return nil, req, err
