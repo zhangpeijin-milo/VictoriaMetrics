@@ -162,14 +162,15 @@ consul_sd_configs:
 	wg := sync.WaitGroup{}
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		go func() {
+		go func(n int) {
 			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(n)))
 			for i := 0; i < iterations; i++ {
-				rnd := rand.Intn(len(paths))
+				rnd := r.Intn(len(paths))
 				_ = cw.reload(paths[rnd]) // update can fail and this is expected
 				_ = cw.notifiers()
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 }
@@ -315,5 +316,49 @@ func TestMergeHTTPClientConfigs(t *testing.T) {
 	}
 	if result.BasicAuth == nil {
 		t.Fatalf("expected BasicAuth tp be present")
+	}
+}
+
+func TestParseLabels(t *testing.T) {
+	testCases := []struct {
+		name            string
+		target          string
+		cfg             *Config
+		expectedAddress string
+		expectedErr     bool
+	}{
+		{
+			"invalid address",
+			"invalid:*//url",
+			&Config{},
+			"",
+			true,
+		},
+		{
+			"use some default params",
+			"alertmanager:9093",
+			&Config{PathPrefix: "test"},
+			"http://alertmanager:9093/test/api/v2/alerts",
+			false,
+		},
+		{
+			"use target address",
+			"https://alertmanager:9093/api/v1/alerts",
+			&Config{Scheme: "http", PathPrefix: "test"},
+			"https://alertmanager:9093/api/v1/alerts",
+			false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			address, _, err := parseLabels(tc.target, nil, tc.cfg)
+			if err == nil == tc.expectedErr {
+				t.Fatalf("unexpected error; got %t; want %t", err != nil, tc.expectedErr)
+			}
+			if address != tc.expectedAddress {
+				t.Fatalf("unexpected address; got %q; want %q", address, tc.expectedAddress)
+			}
+		})
 	}
 }

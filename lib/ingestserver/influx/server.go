@@ -37,10 +37,13 @@ type Server struct {
 //
 // The incoming connections are processed with insertHandler.
 //
+// If useProxyProtocol is set to true, then the incoming connections are accepted via proxy protocol.
+// See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
+//
 // MustStop must be called on the returned server when it is no longer needed.
-func MustStart(addr string, insertHandler func(r io.Reader) error) *Server {
+func MustStart(addr string, useProxyProtocol bool, insertHandler func(r io.Reader) error) *Server {
 	logger.Infof("starting TCP InfluxDB server at %q", addr)
-	lnTCP, err := netutil.NewTCPListener("influx", addr, nil)
+	lnTCP, err := netutil.NewTCPListener("influx", addr, useProxyProtocol, nil)
 	if err != nil {
 		logger.Fatalf("cannot start TCP InfluxDB server at %q: %s", addr, err)
 	}
@@ -56,7 +59,7 @@ func MustStart(addr string, insertHandler func(r io.Reader) error) *Server {
 		lnTCP: lnTCP,
 		lnUDP: lnUDP,
 	}
-	s.cm.Init()
+	s.cm.Init("influx")
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -82,7 +85,7 @@ func (s *Server) MustStop() {
 	if err := s.lnUDP.Close(); err != nil {
 		logger.Errorf("cannot close UDP InfluxDB server: %s", err)
 	}
-	s.cm.CloseAll()
+	s.cm.CloseAll(0)
 	s.wg.Wait()
 	logger.Infof("TCP and UDP InfluxDB servers at %q have been stopped", s.addr)
 }

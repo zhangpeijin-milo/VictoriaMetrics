@@ -1,20 +1,18 @@
 package main
 
 import (
-	"fmt"
 	"net/url"
 	"path"
 	"strings"
 )
 
-func (up *URLPrefix) mergeURLs(requestURI *url.URL) *url.URL {
-	pu := up.getNextURL()
-	return mergeURLs(pu, requestURI)
-}
-
-func mergeURLs(uiURL, requestURI *url.URL) *url.URL {
+func mergeURLs(uiURL, requestURI *url.URL, dropSrcPathPrefixParts int) *url.URL {
 	targetURL := *uiURL
-	targetURL.Path += requestURI.Path
+	srcPath := dropPrefixParts(requestURI.Path, dropSrcPathPrefixParts)
+	if strings.HasPrefix(srcPath, "/") {
+		targetURL.Path = strings.TrimSuffix(targetURL.Path, "/")
+	}
+	targetURL.Path += srcPath
 	requestParams := requestURI.Query()
 	// fast path
 	if len(requestParams) == 0 {
@@ -35,12 +33,52 @@ func mergeURLs(uiURL, requestURI *url.URL) *url.URL {
 	return &targetURL
 }
 
-func createTargetURL(ui *UserInfo, uOrig *url.URL) (*url.URL, []Header, error) {
+func dropPrefixParts(path string, parts int) string {
+	if parts <= 0 {
+		return path
+	}
+	for parts > 0 {
+		path = strings.TrimPrefix(path, "/")
+		n := strings.IndexByte(path, '/')
+		if n < 0 {
+			return ""
+		}
+		path = path[n:]
+		parts--
+	}
+	return path
+}
+
+func (ui *UserInfo) getURLPrefixAndHeaders(u *url.URL) (*URLPrefix, HeadersConf) {
+	for _, e := range ui.URLMaps {
+		if matchAnyRegex(e.SrcHosts, u.Host) && matchAnyRegex(e.SrcPaths, u.Path) {
+			return e.URLPrefix, e.HeadersConf
+		}
+	}
+	if ui.URLPrefix != nil {
+		return ui.URLPrefix, ui.HeadersConf
+	}
+	return nil, HeadersConf{}
+}
+
+func matchAnyRegex(rs []*Regex, s string) bool {
+	if len(rs) == 0 {
+		return true
+	}
+	for _, r := range rs {
+		if r.match(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeURL(uOrig *url.URL) *url.URL {
 	u := *uOrig
 	// Prevent from attacks with using `..` in r.URL.Path
 	u.Path = path.Clean(u.Path)
 	if !strings.HasSuffix(u.Path, "/") && strings.HasSuffix(uOrig.Path, "/") {
-		// The path.Clean() removes traling slash.
+		// The path.Clean() removes trailing slash.
 		// Return it back if needed.
 		// This should fix https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1752
 		u.Path += "/"
@@ -52,16 +90,5 @@ func createTargetURL(ui *UserInfo, uOrig *url.URL) (*url.URL, []Header, error) {
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/1554
 		u.Path = ""
 	}
-	for _, e := range ui.URLMap {
-		for _, sp := range e.SrcPaths {
-			if sp.match(u.Path) {
-				return e.URLPrefix.mergeURLs(&u), e.Headers, nil
-			}
-		}
-	}
-	if ui.URLPrefix != nil {
-		return ui.URLPrefix.mergeURLs(&u), ui.Headers, nil
-	}
-	missingRouteRequests.Inc()
-	return nil, nil, fmt.Errorf("missing route for %q", u.String())
+	return &u
 }

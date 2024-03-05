@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
 
@@ -30,7 +31,7 @@ type SDConfig struct {
 	ProxyURL         *proxy.URL                `yaml:"proxy_url,omitempty"`
 	Namespaces       Namespaces                `yaml:"namespaces,omitempty"`
 	Selectors        []Selector                `yaml:"selectors,omitempty"`
-	AttachMetadata   AttachMetadata            `yaml:"attach_metadata,omitempty"`
+	AttachMetadata   *AttachMetadata           `yaml:"attach_metadata,omitempty"`
 
 	cfg      *apiConfig
 	startErr error
@@ -69,7 +70,7 @@ type Selector struct {
 }
 
 // ScrapeWorkConstructorFunc must construct ScrapeWork object for the given metaLabels.
-type ScrapeWorkConstructorFunc func(metaLabels map[string]string) interface{}
+type ScrapeWorkConstructorFunc func(metaLabels *promutils.Labels) interface{}
 
 // GetScrapeWorkObjects returns ScrapeWork objects for the given sdc.
 //

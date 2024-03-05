@@ -19,29 +19,38 @@ type InsertCtx struct {
 	mrs            []storage.MetricRow
 	metricNamesBuf []byte
 
-	relabelCtx relabel.Ctx
+	relabelCtx    relabel.Ctx
+	streamAggrCtx streamAggrCtx
+
+	skipStreamAggr bool
 }
 
 // Reset resets ctx for future fill with rowsLen rows.
 func (ctx *InsertCtx) Reset(rowsLen int) {
-	for i := range ctx.Labels {
-		label := &ctx.Labels[i]
-		label.Name = nil
-		label.Value = nil
+	labels := ctx.Labels
+	for i := range labels {
+		labels[i] = prompb.Label{}
 	}
-	ctx.Labels = ctx.Labels[:0]
+	ctx.Labels = labels[:0]
 
-	for i := range ctx.mrs {
-		mr := &ctx.mrs[i]
-		mr.MetricNameRaw = nil
+	mrs := ctx.mrs
+	for i := range mrs {
+		cleanMetricRow(&mrs[i])
 	}
-	ctx.mrs = ctx.mrs[:0]
+	ctx.mrs = mrs[:0]
+
 	if n := rowsLen - cap(ctx.mrs); n > 0 {
 		ctx.mrs = append(ctx.mrs[:cap(ctx.mrs)], make([]storage.MetricRow, n)...)
 	}
 	ctx.mrs = ctx.mrs[:0]
 	ctx.metricNamesBuf = ctx.metricNamesBuf[:0]
 	ctx.relabelCtx.Reset()
+	ctx.streamAggrCtx.Reset()
+	ctx.skipStreamAggr = false
+}
+
+func cleanMetricRow(mr *storage.MetricRow) {
+	mr.MetricNameRaw = nil
 }
 
 func (ctx *InsertCtx) marshalMetricNameRaw(prefix []byte, labels []prompb.Label) []byte {
@@ -102,8 +111,8 @@ func (ctx *InsertCtx) AddLabelBytes(name, value []byte) {
 	ctx.Labels = append(ctx.Labels, prompb.Label{
 		// Do not copy name and value contents for performance reasons.
 		// This reduces GC overhead on the number of objects and allocations.
-		Name:  name,
-		Value: value,
+		Name:  bytesutil.ToUnsafeString(name),
+		Value: bytesutil.ToUnsafeString(value),
 	})
 }
 
@@ -120,8 +129,8 @@ func (ctx *InsertCtx) AddLabel(name, value string) {
 	ctx.Labels = append(ctx.Labels, prompb.Label{
 		// Do not copy name and value contents for performance reasons.
 		// This reduces GC overhead on the number of objects and allocations.
-		Name:  bytesutil.ToUnsafeBytes(name),
-		Value: bytesutil.ToUnsafeBytes(value),
+		Name:  name,
+		Value: value,
 	})
 }
 
@@ -132,6 +141,19 @@ func (ctx *InsertCtx) ApplyRelabeling() {
 
 // FlushBufs flushes buffered rows to the underlying storage.
 func (ctx *InsertCtx) FlushBufs() error {
+	sas := sasGlobal.Load()
+	if (sas != nil || deduplicator != nil) && !ctx.skipStreamAggr {
+		matchIdxs := matchIdxsPool.Get()
+		matchIdxs.B = ctx.streamAggrCtx.push(ctx.mrs, matchIdxs.B)
+		if !*streamAggrKeepInput {
+			// Remove aggregated rows from ctx.mrs
+			ctx.dropAggregatedRows(matchIdxs.B)
+		}
+		matchIdxsPool.Put(matchIdxs)
+	}
+	// There is no need in limiting the number of concurrent calls to vmstorage.AddRows() here,
+	// since the number of concurrent FlushBufs() calls should be already limited via writeconcurrencylimiter
+	// used at every stream.Parse() call under lib/protoparser/*
 	err := vmstorage.AddRows(ctx.mrs)
 	ctx.Reset(0)
 	if err == nil {
@@ -142,3 +164,23 @@ func (ctx *InsertCtx) FlushBufs() error {
 		StatusCode: http.StatusServiceUnavailable,
 	}
 }
+
+func (ctx *InsertCtx) dropAggregatedRows(matchIdxs []byte) {
+	dst := ctx.mrs[:0]
+	src := ctx.mrs
+	if !*streamAggrDropInput {
+		for idx, match := range matchIdxs {
+			if match == 1 {
+				continue
+			}
+			dst = append(dst, src[idx])
+		}
+	}
+	tail := src[len(dst):]
+	for i := range tail {
+		cleanMetricRow(&tail[i])
+	}
+	ctx.mrs = dst
+}
+
+var matchIdxsPool bytesutil.ByteBufferPool

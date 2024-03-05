@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"math"
 	"strings"
 	"testing"
 	textTpl "text/template"
@@ -50,6 +51,45 @@ func TestTemplateFuncs(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected mismatch")
 	}
+
+	formatting := func(funcName string, p interface{}, resultExpected string) {
+		t.Helper()
+		v := funcs[funcName]
+		fLocal := v.(func(s interface{}) (string, error))
+		result, err := fLocal(p)
+		if err != nil {
+			t.Fatalf("unexpected error for %s(%f): %s", funcName, p, err)
+		}
+		if result != resultExpected {
+			t.Fatalf("unexpected result for %s(%f); got\n%s\nwant\n%s", funcName, p, result, resultExpected)
+		}
+	}
+	formatting("humanize1024", float64(0), "0")
+	formatting("humanize1024", math.Inf(0), "+Inf")
+	formatting("humanize1024", math.NaN(), "NaN")
+	formatting("humanize1024", float64(127087), "124.1ki")
+	formatting("humanize1024", float64(130137088), "124.1Mi")
+	formatting("humanize1024", float64(133260378112), "124.1Gi")
+	formatting("humanize1024", float64(136458627186688), "124.1Ti")
+	formatting("humanize1024", float64(139733634239168512), "124.1Pi")
+	formatting("humanize1024", float64(143087241460908556288), "124.1Ei")
+	formatting("humanize1024", float64(146521335255970361638912), "124.1Zi")
+	formatting("humanize1024", float64(150037847302113650318245888), "124.1Yi")
+	formatting("humanize1024", float64(153638755637364377925883789312), "1.271e+05Yi")
+
+	formatting("humanize", float64(127087), "127.1k")
+	formatting("humanize", float64(136458627186688), "136.5T")
+
+	formatting("humanizeDuration", 1, "1s")
+	formatting("humanizeDuration", 0.2, "200ms")
+	formatting("humanizeDuration", 42000, "11h 40m 0s")
+	formatting("humanizeDuration", 16790555, "194d 8h 2m 35s")
+
+	formatting("humanizePercentage", 1, "100%")
+	formatting("humanizePercentage", 0.8, "80%")
+	formatting("humanizePercentage", 0.015, "1.5%")
+
+	formatting("humanizeTimestamp", 1679055557, "2023-03-17 12:19:17 +0000 UTC")
 }
 
 func mkTemplate(current, replacement interface{}) textTemplate {

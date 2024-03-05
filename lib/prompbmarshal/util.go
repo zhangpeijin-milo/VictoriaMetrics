@@ -4,8 +4,8 @@ import (
 	"fmt"
 )
 
-// MarshalWriteRequest marshals wr to dst and returns the result.
-func MarshalWriteRequest(dst []byte, wr *WriteRequest) []byte {
+// MarshalProtobuf marshals wr to dst and returns the result.
+func (wr *WriteRequest) MarshalProtobuf(dst []byte) []byte {
 	size := wr.Size()
 	dstLen := len(dst)
 	if n := size - (cap(dst) - dstLen); n > 0 {
@@ -19,17 +19,13 @@ func MarshalWriteRequest(dst []byte, wr *WriteRequest) []byte {
 	return dst[:dstLen+n]
 }
 
-// ResetWriteRequest resets wr.
-func ResetWriteRequest(wr *WriteRequest) {
+// Reset resets wr.
+func (wr *WriteRequest) Reset() {
 	wr.Timeseries = ResetTimeSeries(wr.Timeseries)
 }
 
 // ResetTimeSeries clears all the GC references from tss and returns an empty tss ready for further use.
 func ResetTimeSeries(tss []TimeSeries) []TimeSeries {
-	for i := range tss {
-		ts := tss[i]
-		ts.Labels = nil
-		ts.Samples = nil
-	}
+	clear(tss)
 	return tss[:0]
 }

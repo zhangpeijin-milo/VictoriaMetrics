@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 // SDCheckInterval defines interval for targets refresh.
@@ -24,7 +25,7 @@ type SDConfig struct {
 }
 
 // GetLabels returns labels for Yandex Cloud according to service discover config.
-func (sdc *SDConfig) GetLabels(baseDir string) ([]map[string]string, error) {
+func (sdc *SDConfig) GetLabels(baseDir string) ([]*promutils.Labels, error) {
 	cfg, err := getAPIConfig(sdc, baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot get API config: %w", err)
@@ -33,7 +34,7 @@ func (sdc *SDConfig) GetLabels(baseDir string) ([]map[string]string, error) {
 	case "compute":
 		return getInstancesLabels(cfg)
 	default:
-		return nil, fmt.Errorf("unexpected `service`: %q; only `compute` supported yet; skipping it", sdc.Service)
+		return nil, fmt.Errorf("skipping unexpected service=%q; only `compute` supported for now", sdc.Service)
 	}
 }
 

@@ -11,12 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VictoriaMetrics/metricsql"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
-	"github.com/VictoriaMetrics/metricsql"
 )
 
 var transformFuncs = map[string]transformFunc{
@@ -41,9 +42,11 @@ var transformFuncs = map[string]transformFunc{
 	"cosh":                       newTransformFuncOneArg(transformCosh),
 	"day_of_month":               newTransformFuncDateTime(transformDayOfMonth),
 	"day_of_week":                newTransformFuncDateTime(transformDayOfWeek),
+	"day_of_year":                newTransformFuncDateTime(transformDayOfYear),
 	"days_in_month":              newTransformFuncDateTime(transformDaysInMonth),
 	"deg":                        newTransformFuncOneArg(transformDeg),
 	"drop_common_labels":         transformDropCommonLabels,
+	"drop_empty_series":          transformDropEmptySeries,
 	"end":                        newTransformFuncZeroArgs(transformEnd),
 	"exp":                        newTransformFuncOneArg(transformExp),
 	"floor":                      newTransformFuncOneArg(transformFloor),
@@ -73,6 +76,7 @@ var transformFuncs = map[string]transformFunc{
 	"label_uppercase":            transformLabelUppercase,
 	"label_value":                transformLabelValue,
 	"limit_offset":               transformLimitOffset,
+	"labels_equal":               transformLabelsEqual,
 	"ln":                         newTransformFuncOneArg(transformLn),
 	"log2":                       newTransformFuncOneArg(transformLog2),
 	"log10":                      newTransformFuncOneArg(transformLog10),
@@ -88,10 +92,19 @@ var transformFuncs = map[string]transformFunc{
 	"range_avg":                  newTransformFuncRange(runningAvg),
 	"range_first":                transformRangeFirst,
 	"range_last":                 transformRangeLast,
+	"range_linear_regression":    transformRangeLinearRegression,
+	"range_mad":                  transformRangeMAD,
 	"range_max":                  newTransformFuncRange(runningMax),
 	"range_min":                  newTransformFuncRange(runningMin),
+	"range_normalize":            transformRangeNormalize,
 	"range_quantile":             transformRangeQuantile,
+	"range_stddev":               transformRangeStddev,
+	"range_stdvar":               transformRangeStdvar,
 	"range_sum":                  newTransformFuncRange(runningSum),
+	"range_trim_outliers":        transformRangeTrimOutliers,
+	"range_trim_spikes":          transformRangeTrimSpikes,
+	"range_trim_zscore":          transformRangeTrimZscore,
+	"range_zscore":               transformRangeZscore,
 	"remove_resets":              transformRemoveResets,
 	"round":                      transformRound,
 	"running_avg":                newTransformFuncRunning(runningAvg),
@@ -125,25 +138,29 @@ var transformFuncs = map[string]transformFunc{
 // These functions don't change physical meaning of input time series,
 // so they don't drop metric name
 var transformFuncsKeepMetricName = map[string]bool{
-	"ceil":               true,
-	"clamp":              true,
-	"clamp_max":          true,
-	"clamp_min":          true,
-	"floor":              true,
-	"interpolate":        true,
-	"keep_last_value":    true,
-	"keep_next_value":    true,
-	"range_avg":          true,
-	"range_first":        true,
-	"range_last":         true,
-	"range_max":          true,
-	"range_min":          true,
-	"range_quantile":     true,
-	"round":              true,
-	"running_avg":        true,
-	"running_max":        true,
-	"running_min":        true,
-	"smooth_exponential": true,
+	"ceil":                    true,
+	"clamp":                   true,
+	"clamp_max":               true,
+	"clamp_min":               true,
+	"floor":                   true,
+	"interpolate":             true,
+	"keep_last_value":         true,
+	"keep_next_value":         true,
+	"range_avg":               true,
+	"range_first":             true,
+	"range_last":              true,
+	"range_linear_regression": true,
+	"range_max":               true,
+	"range_min":               true,
+	"range_normalize":         true,
+	"range_quantile":          true,
+	"range_stdvar":            true,
+	"range_sddev":             true,
+	"round":                   true,
+	"running_avg":             true,
+	"running_max":             true,
+	"running_min":             true,
+	"smooth_exponential":      true,
 }
 
 func getTransformFunc(s string) transformFunc {
@@ -227,7 +244,11 @@ func getAbsentTimeseries(ec *EvalConfig, arg metricsql.Expr) []*timeseries {
 	if !ok {
 		return rvs
 	}
-	tfs := searchutils.ToTagFilters(me.LabelFilters)
+	tfss := searchutils.ToTagFilterss(me.LabelFilterss)
+	if len(tfss) != 1 {
+		return rvs
+	}
+	tfs := tfss[0]
 	for i := range tfs {
 		tf := &tfs[i]
 		if len(tf.Key) == 0 {
@@ -333,6 +354,10 @@ func newTransformFuncDateTime(f func(t time.Time) int) transformFunc {
 	}
 }
 
+func transformDayOfYear(t time.Time) int {
+	return t.YearDay()
+}
+
 func transformDayOfMonth(t time.Time) int {
 	return t.Day()
 }
@@ -362,13 +387,9 @@ func transformBucketsLimit(tfa *transformFuncArg) ([]*timeseries, error) {
 	if err := expectTransformArgsNum(args, 2); err != nil {
 		return nil, err
 	}
-	limits, err := getScalar(args[0], 1)
+	limit, err := getIntNumber(args[0], 0)
 	if err != nil {
 		return nil, err
-	}
-	limit := 0
-	if len(limits) > 0 {
-		limit = int(limits[0])
 	}
 	if limit <= 0 {
 		return nil, nil
@@ -381,6 +402,7 @@ func transformBucketsLimit(tfa *transformFuncArg) ([]*timeseries, error) {
 	if len(tss) == 0 {
 		return nil, nil
 	}
+	pointsCount := len(tss[0].Values)
 
 	// Group timeseries by all MetricGroup+tags excluding `le` tag.
 	type x struct {
@@ -405,7 +427,8 @@ func transformBucketsLimit(tfa *transformFuncArg) ([]*timeseries, error) {
 		mn.CopyFrom(&ts.MetricName)
 		mn.RemoveTag("le")
 		b = marshalMetricNameSorted(b[:0], &mn)
-		m[string(b)] = append(m[string(b)], x{
+		k := string(b)
+		m[k] = append(m[k], x{
 			le: le,
 			ts: ts,
 		})
@@ -428,7 +451,7 @@ func transformBucketsLimit(tfa *transformFuncArg) ([]*timeseries, error) {
 		sort.Slice(leGroup, func(i, j int) bool {
 			return leGroup[i].le < leGroup[j].le
 		})
-		for n := range limits {
+		for n := 0; n < pointsCount; n++ {
 			prevValue := float64(0)
 			for i := range leGroup {
 				xx := &leGroup[i]
@@ -507,7 +530,8 @@ func vmrangeBucketsToLE(tss []*timeseries) []*timeseries {
 		ts.MetricName.RemoveTag("le")
 		ts.MetricName.RemoveTag("vmrange")
 		bb.B = marshalMetricNameSorted(bb.B[:0], &ts.MetricName)
-		m[string(bb.B)] = append(m[string(bb.B)], x{
+		k := string(bb.B)
+		m[k] = append(m[k], x{
 			startStr: startStr,
 			endStr:   endStr,
 			start:    start,
@@ -544,18 +568,28 @@ func vmrangeBucketsToLE(tss []*timeseries) []*timeseries {
 		for _, xs := range xss {
 			ts := xs.ts
 			if isZeroTS(ts) {
-				// Skip time series with zeros. They are substituted by xssNew below.
-				xsPrev = xs
+				// Skip buckets with zero values - they will be merged into a single bucket
+				// when the next non-zero bucket appears.
+
+				// Do not store xs in xsPrev in order to properly create `le` time series
+				// for zero buckets.
+				// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/4021
 				continue
 			}
-			if xs.start != xsPrev.end && uniqTs[xs.startStr] == nil {
-				uniqTs[xs.startStr] = xs.ts
-				xssNew = append(xssNew, x{
-					endStr: xs.startStr,
-					end:    xs.start,
-					ts:     copyTS(ts, xs.startStr),
-				})
+			if xs.start != xsPrev.end {
+				// There is a gap between the previous bucket and the current bucket
+				// or the previous bucket is skipped because it was zero.
+				// Fill it with a time series with le=xs.start.
+				if uniqTs[xs.startStr] == nil {
+					uniqTs[xs.startStr] = xs.ts
+					xssNew = append(xssNew, x{
+						endStr: xs.startStr,
+						end:    xs.start,
+						ts:     copyTS(ts, xs.startStr),
+					})
+				}
 			}
+			// Convert the current time series to a time series with le=xs.end
 			ts.MetricName.AddTag("le", xs.endStr)
 			prevTs := uniqTs[xs.endStr]
 			if prevTs != nil {
@@ -567,7 +601,7 @@ func vmrangeBucketsToLE(tss []*timeseries) []*timeseries {
 			}
 			xsPrev = xs
 		}
-		if !math.IsInf(xsPrev.end, 1) && !isZeroTS(xsPrev.ts) {
+		if xsPrev.ts != nil && !math.IsInf(xsPrev.end, 1) && !isZeroTS(xsPrev.ts) {
 			xssNew = append(xssNew, x{
 				endStr: "+Inf",
 				end:    math.Inf(1),
@@ -996,7 +1030,8 @@ func groupLeTimeseries(tss []*timeseries) map[string][]leTimeseries {
 		ts.MetricName.ResetMetricGroup()
 		ts.MetricName.RemoveTag("le")
 		bb.B = marshalMetricTagsSorted(bb.B[:0], &ts.MetricName)
-		m[string(bb.B)] = append(m[string(bb.B)], leTimeseries{
+		k := string(bb.B)
+		m[k] = append(m[k], leTimeseries{
 			le: le,
 			ts: ts,
 		})
@@ -1063,18 +1098,18 @@ func transformHour(t time.Time) int {
 	return t.Hour()
 }
 
-func runningSum(a, b float64, idx int) float64 {
+func runningSum(a, b float64, _ int) float64 {
 	return a + b
 }
 
-func runningMax(a, b float64, idx int) float64 {
+func runningMax(a, b float64, _ int) float64 {
 	if a > b {
 		return a
 	}
 	return b
 }
 
-func runningMin(a, b float64, idx int) float64 {
+func runningMin(a, b float64, _ int) float64 {
 	if a < b {
 		return a
 	}
@@ -1156,7 +1191,8 @@ func transformInterpolate(tfa *transformFuncArg) ([]*timeseries, error) {
 	}
 	rvs := args[0]
 	for _, ts := range rvs {
-		values := ts.Values
+		values := skipLeadingNaNs(ts.Values)
+		values = skipTrailingNaNs(values)
 		if len(values) == 0 {
 			continue
 		}
@@ -1232,6 +1268,241 @@ func newTransformFuncRange(rf func(a, b float64, idx int) float64) transformFunc
 		setLastValues(rvs)
 		return rvs, nil
 	}
+}
+
+func transformRangeNormalize(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	var rvs []*timeseries
+	for _, tss := range args {
+		for _, ts := range tss {
+			values := ts.Values
+			vMin := inf
+			vMax := -inf
+			for _, v := range values {
+				if math.IsNaN(v) {
+					continue
+				}
+				if v < vMin {
+					vMin = v
+				}
+				if v > vMax {
+					vMax = v
+				}
+			}
+			d := vMax - vMin
+			if math.IsInf(d, 0) {
+				continue
+			}
+			for i, v := range values {
+				values[i] = (v - vMin) / d
+			}
+			rvs = append(rvs, ts)
+		}
+	}
+	return rvs, nil
+}
+
+func transformRangeTrimZscore(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 2); err != nil {
+		return nil, err
+	}
+	zs, err := getScalar(args[0], 0)
+	if err != nil {
+		return nil, err
+	}
+	z := float64(0)
+	if len(zs) > 0 {
+		z = math.Abs(zs[0])
+	}
+	// Trim samples with z-score above z.
+	rvs := args[1]
+	for _, ts := range rvs {
+		values := ts.Values
+		qStddev := stddev(values)
+		avg := mean(values)
+		for i, v := range values {
+			zCurr := math.Abs(v-avg) / qStddev
+			if zCurr > z {
+				values[i] = nan
+			}
+		}
+	}
+	return rvs, nil
+}
+
+func transformRangeZscore(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 1); err != nil {
+		return nil, err
+	}
+	rvs := args[0]
+	for _, ts := range rvs {
+		values := ts.Values
+		qStddev := stddev(values)
+		avg := mean(values)
+		for i, v := range values {
+			values[i] = (v - avg) / qStddev
+		}
+	}
+	return rvs, nil
+}
+
+func mean(values []float64) float64 {
+	var sum float64
+	var n int
+	for _, v := range values {
+		if !math.IsNaN(v) {
+			sum += v
+			n++
+		}
+	}
+	return sum / float64(n)
+}
+
+func transformRangeTrimOutliers(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 2); err != nil {
+		return nil, err
+	}
+	ks, err := getScalar(args[0], 0)
+	if err != nil {
+		return nil, err
+	}
+	k := float64(0)
+	if len(ks) > 0 {
+		k = ks[0]
+	}
+	// Trim samples satisfying the `abs(v - range_median(q)) > k*range_mad(q)`
+	rvs := args[1]
+	for _, ts := range rvs {
+		values := ts.Values
+		dMax := k * mad(values)
+		qMedian := quantile(0.5, values)
+		for i, v := range values {
+			if math.Abs(v-qMedian) > dMax {
+				values[i] = nan
+			}
+		}
+	}
+	return rvs, nil
+}
+
+func transformRangeTrimSpikes(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 2); err != nil {
+		return nil, err
+	}
+	phis, err := getScalar(args[0], 0)
+	if err != nil {
+		return nil, err
+	}
+	phi := float64(0)
+	if len(phis) > 0 {
+		phi = phis[0]
+	}
+	// Trim 100% * (phi / 2) samples with the lowest / highest values per each time series
+	phi /= 2
+	phiUpper := 1 - phi
+	phiLower := phi
+	rvs := args[1]
+	a := getFloat64s()
+	values := a.A[:0]
+	for _, ts := range rvs {
+		values := values[:0]
+		originValues := ts.Values
+		for _, v := range originValues {
+			if math.IsNaN(v) {
+				continue
+			}
+			values = append(values, v)
+		}
+		sort.Float64s(values)
+		vMax := quantileSorted(phiUpper, values)
+		vMin := quantileSorted(phiLower, values)
+		for i, v := range originValues {
+			if math.IsNaN(v) {
+				continue
+			}
+			if v > vMax {
+				originValues[i] = nan
+			} else if v < vMin {
+				originValues[i] = nan
+			}
+		}
+	}
+	a.A = values
+	putFloat64s(a)
+	return rvs, nil
+}
+
+func transformRangeLinearRegression(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 1); err != nil {
+		return nil, err
+	}
+	rvs := args[0]
+	for _, ts := range rvs {
+		values := ts.Values
+		timestamps := ts.Timestamps
+		if len(timestamps) == 0 {
+			continue
+		}
+		interceptTimestamp := timestamps[0]
+		v, k := linearRegression(values, timestamps, interceptTimestamp)
+		for i, t := range timestamps {
+			values[i] = v + k*float64(t-interceptTimestamp)/1e3
+		}
+	}
+	return rvs, nil
+}
+
+func transformRangeMAD(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 1); err != nil {
+		return nil, err
+	}
+	rvs := args[0]
+	for _, ts := range rvs {
+		values := ts.Values
+		v := mad(values)
+		for i := range values {
+			values[i] = v
+		}
+	}
+	return rvs, nil
+}
+
+func transformRangeStddev(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 1); err != nil {
+		return nil, err
+	}
+	rvs := args[0]
+	for _, ts := range rvs {
+		values := ts.Values
+		v := stddev(values)
+		for i := range values {
+			values[i] = v
+		}
+	}
+	return rvs, nil
+}
+
+func transformRangeStdvar(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 1); err != nil {
+		return nil, err
+	}
+	rvs := args[0]
+	for _, ts := range rvs {
+		values := ts.Values
+		v := stdvar(values)
+		for i := range values {
+			values[i] = v
+		}
+	}
+	return rvs, nil
 }
 
 func transformRangeQuantile(tfa *transformFuncArg) ([]*timeseries, error) {
@@ -1393,10 +1664,11 @@ func transformUnion(tfa *transformFuncArg) ([]*timeseries, error) {
 	for _, arg := range args {
 		for _, ts := range arg {
 			bb.B = marshalMetricNameSorted(bb.B[:0], &ts.MetricName)
-			if m[string(bb.B)] {
+			k := string(bb.B)
+			if m[k] {
 				continue
 			}
-			m[string(bb.B)] = true
+			m[k] = true
 			rvs = append(rvs, ts)
 		}
 	}
@@ -1575,6 +1847,15 @@ func transformDropCommonLabels(tfa *transformFuncArg) ([]*timeseries, error) {
 	return rvs, nil
 }
 
+func transformDropEmptySeries(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if err := expectTransformArgsNum(args, 1); err != nil {
+		return nil, err
+	}
+	rvs := removeEmptySeries(args[0])
+	return rvs, nil
+}
+
 func transformLabelCopy(tfa *transformFuncArg) ([]*timeseries, error) {
 	return transformLabelCopyExt(tfa, false)
 }
@@ -1659,8 +1940,7 @@ func transformLabelJoin(tfa *transformFuncArg) ([]*timeseries, error) {
 	for _, ts := range rvs {
 		mn := &ts.MetricName
 		dstValue := getDstValue(mn, dstLabel)
-		b := *dstValue
-		b = b[:0]
+		var b []byte
 		for j, srcLabel := range srcLabels {
 			srcValue := mn.GetTagValue(srcLabel)
 			b = append(b, srcValue...)
@@ -1734,18 +2014,55 @@ func labelReplace(tss []*timeseries, srcLabel string, r *regexp.Regexp, dstLabel
 	replacementBytes := []byte(replacement)
 	for _, ts := range tss {
 		mn := &ts.MetricName
-		dstValue := getDstValue(mn, dstLabel)
 		srcValue := mn.GetTagValue(srcLabel)
 		if !r.Match(srcValue) {
 			continue
 		}
 		b := r.ReplaceAll(srcValue, replacementBytes)
+		dstValue := getDstValue(mn, dstLabel)
 		*dstValue = append((*dstValue)[:0], b...)
 		if len(b) == 0 {
 			mn.RemoveTag(dstLabel)
 		}
 	}
 	return tss, nil
+}
+
+func transformLabelsEqual(tfa *transformFuncArg) ([]*timeseries, error) {
+	args := tfa.args
+	if len(args) < 3 {
+		return nil, fmt.Errorf("unexpected number of args; got %d; want at least 3", len(args))
+	}
+	tss := args[0]
+	var labelNames []string
+	for i, ts := range args[1:] {
+		labelName, err := getString(ts, i+1)
+		if err != nil {
+			return nil, fmt.Errorf("cannot get label name: %w", err)
+		}
+		labelNames = append(labelNames, labelName)
+	}
+	rvs := tss[:0]
+	for _, ts := range tss {
+		if hasIdenticalLabelValues(&ts.MetricName, labelNames) {
+			rvs = append(rvs, ts)
+		}
+	}
+	return rvs, nil
+}
+
+func hasIdenticalLabelValues(mn *storage.MetricName, labelNames []string) bool {
+	if len(labelNames) < 2 {
+		return true
+	}
+	labelValue := mn.GetTagValue(labelNames[0])
+	for _, labelName := range labelNames[1:] {
+		b := mn.GetTagValue(labelName)
+		if string(labelValue) != string(b) {
+			return false
+		}
+	}
+	return true
 }
 
 func transformLabelValue(tfa *transformFuncArg) ([]*timeseries, error) {
@@ -1884,6 +2201,8 @@ func transformLimitOffset(tfa *transformFuncArg) ([]*timeseries, error) {
 	rvs := removeEmptySeries(args[2])
 	if len(rvs) >= offset {
 		rvs = rvs[offset:]
+	} else {
+		rvs = nil
 	}
 	if len(rvs) > limit {
 		rvs = rvs[:limit]
@@ -2323,7 +2642,12 @@ func newTransformBitmap(bitmapFunc func(a, b uint64) uint64) func(tfa *transform
 		}
 		tf := func(values []float64) {
 			for i, v := range values {
-				values[i] = float64(bitmapFunc(uint64(v), uint64(ns[i])))
+				w := ns[i]
+				result := nan
+				if !math.IsNaN(v) && !math.IsNaN(w) {
+					result = float64(bitmapFunc(uint64(v), uint64(w)))
+				}
+				values[i] = result
 			}
 		}
 		return doTransformValues(args[0], tf, tfa.fe)
@@ -2423,14 +2747,15 @@ func copyTimeseriesMetricNames(tss []*timeseries, makeCopy bool) []*timeseries {
 	return rvs
 }
 
-// copyTimeseriesShallow returns a copy of arg with shallow copies of MetricNames,
-// Timestamps and Values.
-func copyTimeseriesShallow(arg []*timeseries) []*timeseries {
-	rvs := make([]*timeseries, len(arg))
-	for i, src := range arg {
-		var dst timeseries
-		dst.CopyShallow(src)
-		rvs[i] = &dst
+// copyTimeseriesShallow returns a copy of src with shallow copies of MetricNames, Timestamps and Values.
+func copyTimeseriesShallow(src []*timeseries) []*timeseries {
+	tss := make([]timeseries, len(src))
+	for i, src := range src {
+		tss[i].CopyShallow(src)
+	}
+	rvs := make([]*timeseries, len(tss))
+	for i := range tss {
+		rvs[i] = &tss[i]
 	}
 	return rvs
 }

@@ -57,9 +57,13 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 		}
 		ac, err := opts.NewConfig()
 		if err != nil {
+			return nil, fmt.Errorf("cannot parse TLS config: %w", err)
+		}
+		tlsConfig, err := ac.NewTLSConfig()
+		if err != nil {
 			return nil, fmt.Errorf("cannot initialize TLS config: %w", err)
 		}
-		transport.TLSClientConfig = ac.NewTLSConfig()
+		transport.TLSClientConfig = tlsConfig
 	}
 	cfg := &apiConfig{
 		client: &http.Client{
@@ -221,7 +225,7 @@ func getAPIResponse(apiURL string, cfg *apiConfig) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err != nil {
 		logger.Panicf("BUG: cannot create new request for yandex cloud api url %s: %s", apiURL, err)
 	}

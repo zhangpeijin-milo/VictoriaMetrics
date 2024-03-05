@@ -18,12 +18,12 @@ func BenchmarkMarshalGaugeArray(b *testing.B) {
 			if mt != MarshalTypeZSTDNearestDelta {
 				panic(fmt.Errorf("unexpected marshal type; got %d; expecting %d", mt, MarshalTypeZSTDNearestDelta))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
 
-var Sink uint64
+var Sink atomic.Uint64
 
 func BenchmarkUnmarshalGaugeArray(b *testing.B) {
 	b.ReportAllocs()
@@ -36,16 +36,17 @@ func BenchmarkUnmarshalGaugeArray(b *testing.B) {
 			if err != nil {
 				panic(fmt.Errorf("cannot unmarshal gauge array: %w", err))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
 
 var benchGaugeArray = func() []int64 {
+	r := rand.New(rand.NewSource(1))
 	a := make([]int64, 8*1024)
 	v := int64(0)
 	for i := 0; i < len(a); i++ {
-		v += int64(rand.NormFloat64() * 100)
+		v += int64(r.NormFloat64() * 100)
 		a[i] = v
 	}
 	return a
@@ -67,7 +68,7 @@ func BenchmarkMarshalDeltaConstArray(b *testing.B) {
 			if mt != MarshalTypeDeltaConst {
 				panic(fmt.Errorf("unexpected marshal type; got %d; expecting %d", mt, MarshalTypeDeltaConst))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
@@ -83,7 +84,7 @@ func BenchmarkUnmarshalDeltaConstArray(b *testing.B) {
 			if err != nil {
 				panic(fmt.Errorf("cannot unmarshal delta const array: %w", err))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
@@ -114,7 +115,7 @@ func BenchmarkMarshalConstArray(b *testing.B) {
 			if mt != MarshalTypeConst {
 				panic(fmt.Errorf("unexpected marshal type; got %d; expecting %d", mt, MarshalTypeConst))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
@@ -130,7 +131,7 @@ func BenchmarkUnmarshalConstArray(b *testing.B) {
 			if err != nil {
 				panic(fmt.Errorf("cannot unmarshal const array: %w", err))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
@@ -159,7 +160,7 @@ func BenchmarkMarshalZeroConstArray(b *testing.B) {
 			if mt != MarshalTypeConst {
 				panic(fmt.Errorf("unexpected marshal type; got %d; expecting %d", mt, MarshalTypeConst))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
@@ -175,7 +176,7 @@ func BenchmarkUnmarshalZeroConstArray(b *testing.B) {
 			if err != nil {
 				panic(fmt.Errorf("cannot unmarshal zero const array: %w", err))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
@@ -198,7 +199,7 @@ func BenchmarkMarshalInt64Array(b *testing.B) {
 			if mt != benchMarshalType {
 				panic(fmt.Errorf("unexpected marshal type; got %d; expecting %d", mt, benchMarshalType))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
@@ -214,7 +215,7 @@ func BenchmarkUnmarshalInt64Array(b *testing.B) {
 			if err != nil {
 				panic(fmt.Errorf("cannot unmarshal int64 array: %w", err))
 			}
-			atomic.AddUint64(&Sink, uint64(len(dst)))
+			Sink.Add(uint64(len(dst)))
 		}
 	})
 }
@@ -230,10 +231,11 @@ var benchMarshalType = func() MarshalType {
 }()
 
 var benchInt64Array = func() []int64 {
+	r := rand.New(rand.NewSource(1))
 	var a []int64
 	var v int64
 	for i := 0; i < 8*1024; i++ {
-		v += 30e3 + int64(rand.NormFloat64()*1e3)
+		v += 30e3 + int64(r.NormFloat64()*1e3)
 		a = append(a, v)
 	}
 	return a

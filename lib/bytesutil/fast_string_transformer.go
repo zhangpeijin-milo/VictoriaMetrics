@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 )
 
 // FastStringTransformer implements fast transformer for strings.
@@ -11,30 +13,52 @@ import (
 // It caches transformed strings and returns them back on the next calls
 // without calling the transformFunc, which may be expensive.
 type FastStringTransformer struct {
-	m    atomic.Value
-	mLen uint64
+	lastCleanupTime atomic.Uint64
+
+	m sync.Map
 
 	transformFunc func(s string) string
+}
+
+type fstEntry struct {
+	lastAccessTime atomic.Uint64
+	s              string
 }
 
 // NewFastStringTransformer creates new transformer, which applies transformFunc to strings passed to Transform()
 //
 // transformFunc must return the same result for the same input.
 func NewFastStringTransformer(transformFunc func(s string) string) *FastStringTransformer {
-	var fst FastStringTransformer
-	fst.m.Store(&sync.Map{})
-	fst.transformFunc = transformFunc
-	return &fst
+	fst := &FastStringTransformer{
+		transformFunc: transformFunc,
+	}
+	fst.lastCleanupTime.Store(fasttime.UnixTimestamp())
+	return fst
 }
 
 // Transform applies transformFunc to s and returns the result.
 func (fst *FastStringTransformer) Transform(s string) string {
-	m := fst.m.Load().(*sync.Map)
-	v, ok := m.Load(s)
+	if isSkipCache(s) {
+		sTransformed := fst.transformFunc(s)
+		if sTransformed == s {
+			// Clone a string in order to protect from cases when s contains unsafe string.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3227
+			sTransformed = strings.Clone(sTransformed)
+		}
+		return sTransformed
+	}
+
+	ct := fasttime.UnixTimestamp()
+	v, ok := fst.m.Load(s)
 	if ok {
 		// Fast path - the transformed s is found in the cache.
-		sp := v.(*string)
-		return *sp
+		e := v.(*fstEntry)
+		if e.lastAccessTime.Load()+10 < ct {
+			// Reduce the frequency of e.lastAccessTime update to once per 10 seconds
+			// in order to improve the fast path speed on systems with many CPU cores.
+			e.lastAccessTime.Store(ct)
+		}
+		return e.s
 	}
 	// Slow path - transform s and store it in the cache.
 	sTransformed := fst.transformFunc(s)
@@ -48,12 +72,24 @@ func (fst *FastStringTransformer) Transform(s string) string {
 		// which, in turn, can point to bigger string.
 		sTransformed = s
 	}
-	sp := &sTransformed
-	m.Store(s, sp)
-	n := atomic.AddUint64(&fst.mLen, 1)
-	if n > 100e3 {
-		atomic.StoreUint64(&fst.mLen, 0)
-		fst.m.Store(&sync.Map{})
+	e := &fstEntry{
+		s: sTransformed,
 	}
+	e.lastAccessTime.Store(ct)
+	fst.m.Store(s, e)
+
+	if needCleanup(&fst.lastCleanupTime, ct) {
+		// Perform a global cleanup for fst.m by removing items, which weren't accessed during the last 5 minutes.
+		m := &fst.m
+		deadline := ct - uint64(cacheExpireDuration.Seconds())
+		m.Range(func(k, v interface{}) bool {
+			e := v.(*fstEntry)
+			if e.lastAccessTime.Load() < deadline {
+				m.Delete(k)
+			}
+			return true
+		})
+	}
+
 	return sTransformed
 }

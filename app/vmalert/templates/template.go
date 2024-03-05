@@ -21,17 +21,18 @@ import (
 	"math"
 	"net"
 	"net/url"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	textTpl "text/template"
 	"time"
 
-	textTpl "text/template"
+	"github.com/bmatcuk/doublestar/v4"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/formatutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
@@ -59,12 +60,12 @@ func Load(pathPatterns []string, overwrite bool) error {
 	var err error
 	tmpl := newTemplate()
 	for _, tp := range pathPatterns {
-		p, err := filepath.Glob(tp)
+		p, err := doublestar.FilepathGlob(tp)
 		if err != nil {
 			return fmt.Errorf("failed to retrieve a template glob %q: %w", tp, err)
 		}
 		if len(p) > 0 {
-			tmpl, err = tmpl.ParseGlob(tp)
+			tmpl, err = tmpl.ParseFiles(p...)
 			if err != nil {
 				return fmt.Errorf("failed to parse template glob %q: %w", tp, err)
 			}
@@ -182,6 +183,10 @@ func Get() (*textTpl.Template, error) {
 func FuncsWithQuery(query QueryFn) textTpl.FuncMap {
 	return textTpl.FuncMap{
 		"query": func(q string) ([]metric, error) {
+			if query == nil {
+				return nil, fmt.Errorf("cannot execute query %q: query is not available in this context", q)
+			}
+
 			result, err := query(q)
 			if err != nil {
 				return nil, err
@@ -225,7 +230,7 @@ func templateFuncs() textTpl.FuncMap {
 		"toLower": strings.ToLower,
 
 		// crlfEscape replaces '\n' and '\r' chars with `\\n` and `\\r`.
-		// This funcion is deprectated.
+		// This function is deprecated.
 		//
 		// It is better to use quotesEscape, jsonEscape, queryEscape or pathEscape instead -
 		// these functions properly escape `\n` and `\r` chars according to their purpose.
@@ -350,18 +355,10 @@ func templateFuncs() textTpl.FuncMap {
 			if math.Abs(v) <= 1 || math.IsNaN(v) || math.IsInf(v, 0) {
 				return fmt.Sprintf("%.4g", v), nil
 			}
-			prefix := ""
-			for _, p := range []string{"ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi", "Yi"} {
-				if math.Abs(v) < 1024 {
-					break
-				}
-				prefix = p
-				v /= 1024
-			}
-			return fmt.Sprintf("%.4g%s", v, prefix), nil
+			return formatutil.HumanizeBytes(v), nil
 		},
 
-		// humanizeDuration converts given seconds to a human readable duration
+		// humanizeDuration converts given seconds to a human-readable duration
 		"humanizeDuration": func(i interface{}) (string, error) {
 			v, err := toFloat64(i)
 			if err != nil {

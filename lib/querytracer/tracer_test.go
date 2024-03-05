@@ -1,7 +1,9 @@
 package querytracer
 
 import (
+	"fmt"
 	"regexp"
+	"sync"
 	"testing"
 )
 
@@ -45,7 +47,7 @@ func TestTracerEnabled(t *testing.T) {
 	qt.Printf("parent %d", 789)
 	qt.Donef("foo %d", 33)
 	s := qt.String()
-	sExpected := `- 0ms: test: foo 33
+	sExpected := `- 0ms: : test: foo 33
 | - 0ms: child done 456
 | | - 0ms: foo 123
 | - 0ms: parent 789
@@ -60,7 +62,7 @@ func TestTracerMultiline(t *testing.T) {
 	qt.Printf("line3\nline4\n")
 	qt.Done()
 	s := qt.String()
-	sExpected := `- 0ms: line1
+	sExpected := `- 0ms: : line1
 | line2
 | - 0ms: line3
 | | line4
@@ -84,7 +86,7 @@ func TestTracerToJSON(t *testing.T) {
 	qt.Printf("parent %d", 789)
 	qt.Done()
 	s := qt.ToJSON()
-	sExpected := `{"duration_msec":0,"message":"test","children":[` +
+	sExpected := `{"duration_msec":0,"message":": test","children":[` +
 		`{"duration_msec":0,"message":"child done 456","children":[` +
 		`{"duration_msec":0,"message":"foo 123"}]},` +
 		`{"duration_msec":0,"message":"parent 789"}]}`
@@ -109,9 +111,9 @@ func TestTraceAddJSON(t *testing.T) {
 	}
 	qt.Done()
 	s := qt.String()
-	sExpected := `- 0ms: parent
+	sExpected := `- 0ms: : parent
 | - 0ms: first_line
-| - 0ms: child
+| - 0ms: : child
 | | - 0ms: foo
 | - 0ms: last_line
 `
@@ -120,9 +122,9 @@ func TestTraceAddJSON(t *testing.T) {
 	}
 
 	jsonS := qt.ToJSON()
-	jsonSExpected := `{"duration_msec":0,"message":"parent","children":[` +
+	jsonSExpected := `{"duration_msec":0,"message":": parent","children":[` +
 		`{"duration_msec":0,"message":"first_line"},` +
-		`{"duration_msec":0,"message":"child","children":[` +
+		`{"duration_msec":0,"message":": child","children":[` +
 		`{"duration_msec":0,"message":"foo"}]},` +
 		`{"duration_msec":0,"message":"last_line"}]}`
 	if !areEqualJSONTracesSkipDuration(jsonS, jsonSExpected) {
@@ -137,11 +139,39 @@ func TestTraceMissingDonef(t *testing.T) {
 	qtChild.Printf("child printf")
 	qt.Printf("another parent printf")
 	s := qt.String()
-	sExpected := `- 0ms: parent: missing Tracer.Done() call
-| - 0ms: parent printf
-| - 0ms: child: missing Tracer.Done() call
-| | - 0ms: child printf
-| - 0ms: another parent printf
+	sExpected := `- 0.000ms: missing Tracer.Done() call for the trace with message=: parent
+`
+	if !areEqualTracesSkipDuration(s, sExpected) {
+		t.Fatalf("unexpected trace\ngot\n%s\nwant\n%s", s, sExpected)
+	}
+}
+
+func TestTraceConcurrent(t *testing.T) {
+	qt := New(true, "parent")
+	childLocal := qt.NewChild("local")
+	childLocal.Printf("abc")
+	childLocal.Done()
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		child := qt.NewChild(fmt.Sprintf("child %d", i))
+		wg.Add(1)
+		go func() {
+			for j := 0; j < 100; j++ {
+				child.Printf(fmt.Sprintf("message %d", j))
+			}
+			wg.Done()
+		}()
+	}
+	qt.Done()
+	// Verify that it is safe to call qt.String() when child traces aren't done yet
+	s := qt.String()
+	wg.Wait()
+	sExpected := `- 0.008ms: : parent
+| - 0.002ms: local
+| | - 0.000ms: abc
+| - 0.000ms: missing Tracer.Done() call for the trace with message=child 0
+| - 0.000ms: missing Tracer.Done() call for the trace with message=child 1
+| - 0.000ms: missing Tracer.Done() call for the trace with message=child 2
 `
 	if !areEqualTracesSkipDuration(s, sExpected) {
 		t.Fatalf("unexpected trace\ngot\n%s\nwant\n%s", s, sExpected)

@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 )
 
@@ -23,7 +24,7 @@ func BenchmarkMergeBlockStreamsFourSourcesBestCase(b *testing.B) {
 }
 
 func benchmarkMergeBlockStreams(b *testing.B, mps []*inmemoryPart, rowsPerLoop int64) {
-	var rowsMerged, rowsDeleted uint64
+	var rowsMerged, rowsDeleted atomic.Uint64
 	strg := newTestStorage()
 
 	b.ReportAllocs()
@@ -38,24 +39,27 @@ func benchmarkMergeBlockStreams(b *testing.B, mps []*inmemoryPart, rowsPerLoop i
 		}
 		for pb.Next() {
 			for i, mp := range mps {
-				bsrs[i].InitFromInmemoryPart(mp)
+				bsrs[i].MustInitFromInmemoryPart(mp)
 			}
 			mpOut.Reset()
-			bsw.InitFromInmemoryPart(&mpOut)
+			bsw.MustInitFromInmemoryPart(&mpOut, -5)
 			if err := mergeBlockStreams(&mpOut.ph, &bsw, bsrs, nil, strg, 0, &rowsMerged, &rowsDeleted); err != nil {
 				panic(fmt.Errorf("cannot merge block streams: %w", err))
 			}
 		}
 	})
+
+	stopTestStorage(strg)
 }
 
 var benchTwoSourcesWorstCaseMPS = func() []*inmemoryPart {
+	rng := rand.New(rand.NewSource(1))
 	var rows []rawRow
 	var r rawRow
 	r.PrecisionBits = defaultPrecisionBits
 	for i := 0; i < maxRowsPerBlock/2-1; i++ {
-		r.Value = rand.NormFloat64()
-		r.Timestamp = rand.Int63n(1e12)
+		r.Value = rng.NormFloat64()
+		r.Timestamp = rng.Int63n(1e12)
 		rows = append(rows, r)
 	}
 	mp := newTestInmemoryPart(rows)
@@ -83,12 +87,13 @@ var benchTwoSourcesBestCaseMPS = func() []*inmemoryPart {
 const benchTwoSourcesBestCaseMPSRowsPerLoop = 2 * maxRowsPerBlock
 
 var benchFourSourcesWorstCaseMPS = func() []*inmemoryPart {
+	rng := rand.New(rand.NewSource(1))
 	var rows []rawRow
 	var r rawRow
 	r.PrecisionBits = defaultPrecisionBits
 	for i := 0; i < maxRowsPerBlock/2-1; i++ {
-		r.Value = rand.NormFloat64()
-		r.Timestamp = rand.Int63n(1e12)
+		r.Value = rng.NormFloat64()
+		r.Timestamp = rng.Int63n(1e12)
 		rows = append(rows, r)
 	}
 	mp := newTestInmemoryPart(rows)

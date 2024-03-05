@@ -1,3 +1,13 @@
+---
+weight: 7
+title: How to delete or replace metrics in VictoriaMetrics
+menu:
+  docs:
+    parent: "guides"
+    weight: 7
+aliases:
+- /guides/guide-delete-or-replace-metrics.html
+---
 # How to delete or replace metrics in VictoriaMetrics 
 
 Data deletion is an operation people expect a database to have. [VictoriaMetrics](https://victoriametrics.com) supports 
@@ -20,13 +30,11 @@ To check that metrics are present in **VictoriaMetrics Cluster** run the followi
 
 _Warning: response can return many metrics, so be careful with series selector._
 
-<div class="with-copy" markdown="1">
 
-```console
+```curl
 curl -s 'http://vmselect:8481/select/0/prometheus/api/v1/series?match[]=process_cpu_cores_available' | jq
 ```
 
-</div>
 
 The expected output:
 
@@ -72,21 +80,18 @@ The expected output:
 
 When you're sure [time series selector](https://prometheus.io/docs/prometheus/latest/querying/basics/#time-series-selectors) is correct, send a POST request to [delete API](https://docs.victoriametrics.com/url-examples.html#apiv1admintsdbdelete_series) with [`match[]=<time-series-selector>`](https://prometheus.io/docs/prometheus/latest/querying/basics/#time-series-selectors) argument. For example:
 
-<div class="with-copy" markdown="1">
 
-```console
-curl -s 'http://vmselect:8481/select/0/prometheus/api/v1/series?match[]=process_cpu_cores_available'
+```curl
+curl -s 'http://vmselect:8481/delete/0/prometheus/api/v1/admin/tsdb/delete_series?match[]=process_cpu_cores_available'
 ```
 
-</div>
 
 If operation was successful, the deleted series will stop being [queryable](https://docs.victoriametrics.com/keyConcepts.html#query-data). Storage space for the deleted time series isn't freed instantly - it is freed during subsequent [background merges of data files](https://medium.com/@valyala/how-victoriametrics-makes-instant-snapshots-for-multi-terabyte-time-series-data-e1f3fb0e0282). The background merges may never occur for data from previous months, so storage space won't be freed for historical data. In this case [forced merge](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#forced-merge) may help freeing up storage space.
 
 To trigger [forced merge](https://docs.victoriametrics.com/Single-server-VictoriaMetrics.html#forced-merge) on VictoriaMetrics Cluster run the following command:
 
-<div class="with-copy" markdown="1">
 
-```console
+```curl
 curl -v -X POST http://vmstorage:8482/internal/force_merge
 ```
 
@@ -97,7 +102,7 @@ After the merge is complete, the data will be permanently deleted from the disk.
 By default, VictoriaMetrics doesn't provide a mechanism for replacing or updating data. As a workaround, take the following actions:
 
 - [export time series to a file](https://docs.victoriametrics.com/url-examples.html#apiv1export);
-- change the values of time serie in the file and save it;
+- change the values of time series in the file and save it;
 - [delete time series from a database](https://docs.victoriametrics.com/url-examples.html#apiv1admintsdbdelete_series);
 - [import saved file to VictoriaMetrics](https://docs.victoriametrics.com/url-examples.html#apiv1import).
 
@@ -105,23 +110,19 @@ By default, VictoriaMetrics doesn't provide a mechanism for replacing or updatin
 
 For example, let's export metric for `node_memory_MemTotal_bytes` with labels `instance="node-exporter:9100"` and `job="hostname.com"`:
 
-<div class="with-copy" markdown="1">
 
-```console
+```curl
 curl -X POST -g http://vmselect:8481/select/0/prometheus/api/v1/export -d 'match[]=node_memory_MemTotal_bytes{instance="node-exporter:9100", job="hostname.com"}' > data.jsonl
 ```
 
-</div>
 
 To check that exported file contains time series we can use [cat](https://man7.org/linux/man-pages/man1/cat.1.html) and [jq](https://stedolan.github.io/jq/download/)
 
-<div class="with-copy" markdown="1">
 
-```console
+```curl
 cat data.jsonl | jq
 ```
 
-</div>
 
 The expected output will look like:
 
@@ -150,13 +151,13 @@ The expected output will look like:
 
 In this example, we will replace the values of `node_memory_MemTotal_bytes` from `33604390912` to `17179869184` (from 32Gb to 16Gb) via [sed](https://linux.die.net/man/1/sed), but it can be done in any of the available ways.
 
-```console
+```sh
 sed -i 's/33604390912/17179869184/g' data.jsonl
 ```
 
 Let's check the changes in data.jsonl with `cat`:
 
-```console
+```sh
 cat data.jsonl | jq
 ```
 
@@ -194,22 +195,18 @@ Victoriametrics supports a lot of [ingestion protocols](https://docs.victoriamet
 
 The next command will import metrics from `data.jsonl` to VictoriaMetrics:
 
-<div class="with-copy" markdown="1">
 
-```console
+```curl
 curl -v -X POST http://vminsert:8480/insert/0/prometheus/api/v1/import -T data.jsonl
 ```
-</div>
 
 ### Check imported metrics
 
-<div class="with-copy" markdown="1">
 
-```console
+```curk
 curl -X POST -g http://vmselect:8481/select/0/prometheus/api/v1/export -d match[]=node_memory_MemTotal_bytes
 ```
 
-</div>
 
 The expected output will look like:
 

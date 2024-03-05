@@ -11,8 +11,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/vmimport"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/vmimport/stream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -29,11 +29,9 @@ func InsertHandler(req *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return writeconcurrencylimiter.Do(func() error {
-		isGzipped := req.Header.Get("Content-Encoding") == "gzip"
-		return parser.ParseStream(req.Body, isGzipped, func(rows []parser.Row) error {
-			return insertRows(rows, extraLabels)
-		})
+	isGzipped := req.Header.Get("Content-Encoding") == "gzip"
+	return stream.Parse(req.Body, isGzipped, func(rows []parser.Row) error {
+		return insertRows(rows, extraLabels)
 	})
 }
 

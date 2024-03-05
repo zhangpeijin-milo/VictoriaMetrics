@@ -3,12 +3,13 @@ package storage
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
-// rawRow reperesents raw timeseries row.
+// rawRow represents raw timeseries row.
 type rawRow struct {
 	// TSID is time series id.
 	TSID TSID
@@ -86,7 +87,10 @@ func (rrm *rawRowsMarshaler) marshalToInmemoryPart(mp *inmemoryPart, rows []rawR
 		logger.Panicf("BUG: rows count must be smaller than 2^32; got %d", len(rows))
 	}
 
-	rrm.bsw.InitFromInmemoryPart(mp)
+	// Use the minimum compression level for first-level in-memory blocks,
+	// since they are going to be re-compressed during subsequent merges.
+	const compressLevel = -5 // See https://github.com/facebook/zstd/releases/tag/v1.3.4
+	rrm.bsw.MustInitFromInmemoryPart(mp, compressLevel)
 
 	ph := &mp.ph
 	ph.Reset()
@@ -99,7 +103,7 @@ func (rrm *rawRowsMarshaler) marshalToInmemoryPart(mp *inmemoryPart, rows []rawR
 
 	// Group rows into blocks.
 	var scale int16
-	var rowsMerged uint64
+	var rowsMerged atomic.Uint64
 	r := &rows[0]
 	tsid := &r.TSID
 	precisionBits := r.PrecisionBits
@@ -126,8 +130,8 @@ func (rrm *rawRowsMarshaler) marshalToInmemoryPart(mp *inmemoryPart, rows []rawR
 	rrm.auxValues, scale = decimal.AppendFloatToDecimal(rrm.auxValues[:0], rrm.auxFloatValues)
 	tmpBlock.Init(tsid, rrm.auxTimestamps, rrm.auxValues, scale, precisionBits)
 	rrm.bsw.WriteExternalBlock(tmpBlock, ph, &rowsMerged)
-	if rowsMerged != uint64(len(rows)) {
-		logger.Panicf("BUG: unexpected rowsMerged; got %d; want %d", rowsMerged, len(rows))
+	if n := rowsMerged.Load(); n != uint64(len(rows)) {
+		logger.Panicf("BUG: unexpected rowsMerged; got %d; want %d", n, len(rows))
 	}
 	rrm.bsw.MustClose()
 }

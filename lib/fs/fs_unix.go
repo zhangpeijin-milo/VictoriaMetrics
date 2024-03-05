@@ -1,5 +1,4 @@
 //go:build linux || darwin || freebsd || openbsd
-// +build linux darwin freebsd openbsd
 
 package fs
 
@@ -22,7 +21,7 @@ func mUnmap(data []byte) error {
 func mustSyncPath(path string) {
 	d, err := os.Open(path)
 	if err != nil {
-		logger.Panicf("FATAL: cannot open %q: %s", path, err)
+		logger.Panicf("FATAL: cannot open file for fsync: %s", err)
 	}
 	if err := d.Sync(); err != nil {
 		_ = d.Close()
@@ -45,15 +44,8 @@ func createFlockFile(flockFile string) (*os.File, error) {
 }
 
 func mustGetFreeSpace(path string) uint64 {
-	d, err := os.Open(path)
-	if err != nil {
-		logger.Panicf("FATAL: cannot determine free disk space on %q: %s", path, err)
-	}
-	defer MustClose(d)
-
-	fd := d.Fd()
 	var stat unix.Statfs_t
-	if err := unix.Fstatfs(int(fd), &stat); err != nil {
+	if err := unix.Statfs(path, &stat); err != nil {
 		logger.Panicf("FATAL: cannot determine free disk space on %q: %s", path, err)
 	}
 	return freeSpace(stat)

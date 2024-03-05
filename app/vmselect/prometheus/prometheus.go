@@ -3,6 +3,7 @@ package prometheus
 import (
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/metricsql"
 	"math"
 	"net/http"
 	"runtime"
@@ -12,16 +13,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/bufferedwriter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/promql"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/querystats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bufferedwriter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
@@ -30,13 +32,14 @@ import (
 
 var (
 	latencyOffset = flag.Duration("search.latencyOffset", time.Second*30, "The time when data points become visible in query results after the collection. "+
+		"It can be overridden on per-query basis via latency_offset arg. "+
 		"Too small value can result in incomplete last points for query results")
 	maxQueryLen = flagutil.NewBytes("search.maxQueryLen", 16*1024, "The maximum search query length in bytes")
 	maxLookback = flag.Duration("search.maxLookback", 0, "Synonym to -search.lookback-delta from Prometheus. "+
 		"The value is dynamically detected from interval between time series datapoints if not set. It can be overridden on per-query basis via max_lookback arg. "+
-		"See also '-search.maxStalenessInterval' flag, which has the same meaining due to historical reasons")
+		"See also '-search.maxStalenessInterval' flag, which has the same meaning due to historical reasons")
 	maxStalenessInterval = flag.Duration("search.maxStalenessInterval", 0, "The maximum interval for staleness calculations. "+
-		"By default it is automatically calculated from the median interval between samples. This flag could be useful for tuning "+
+		"By default, it is automatically calculated from the median interval between samples. This flag could be useful for tuning "+
 		"Prometheus data model closer to Influx-style data model. See https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness for details. "+
 		"See also '-search.setLookbackToStep' flag")
 	setLookbackToStep = flag.Bool("search.setLookbackToStep", false, "Whether to fix lookback interval to 'step' query arg value. "+
@@ -44,18 +47,59 @@ var (
 	maxStepForPointsAdjustment = flag.Duration("search.maxStepForPointsAdjustment", time.Minute, "The maximum step when /api/v1/query_range handler adjusts "+
 		"points with timestamps closer than -search.latencyOffset to the current time. The adjustment is needed because such points may contain incomplete data")
 
-	maxUniqueTimeseries    = flag.Int("search.maxUniqueTimeseries", 300e3, "The maximum number of unique time series, which can be selected during /api/v1/query and /api/v1/query_range queries. This option allows limiting memory usage")
-	maxFederateSeries      = flag.Int("search.maxFederateSeries", 1e6, "The maximum number of time series, which can be returned from /federate. This option allows limiting memory usage")
-	maxExportSeries        = flag.Int("search.maxExportSeries", 10e6, "The maximum number of time series, which can be returned from /api/v1/export* APIs. This option allows limiting memory usage")
-	maxTSDBStatusSeries    = flag.Int("search.maxTSDBStatusSeries", 10e6, "The maximum number of time series, which can be processed during the call to /api/v1/status/tsdb. This option allows limiting memory usage")
-	maxSeriesLimit         = flag.Int("search.maxSeries", 30e3, "The maximum number of time series, which can be returned from /api/v1/series. This option allows limiting memory usage")
+	maxUniqueTimeseries = flag.Int("search.maxUniqueTimeseries", 300e3, "The maximum number of unique time series, which can be selected during /api/v1/query and /api/v1/query_range queries. This option allows limiting memory usage")
+	maxFederateSeries   = flag.Int("search.maxFederateSeries", 1e6, "The maximum number of time series, which can be returned from /federate. This option allows limiting memory usage")
+	maxExportSeries     = flag.Int("search.maxExportSeries", 10e6, "The maximum number of time series, which can be returned from /api/v1/export* APIs. This option allows limiting memory usage")
+	maxTSDBStatusSeries = flag.Int("search.maxTSDBStatusSeries", 10e6, "The maximum number of time series, which can be processed during the call to /api/v1/status/tsdb. This option allows limiting memory usage")
+	maxSeriesLimit      = flag.Int("search.maxSeries", 30e3, "The maximum number of time series, which can be returned from /api/v1/series. This option allows limiting memory usage")
+	maxLabelsAPISeries  = flag.Int("search.maxLabelsAPISeries", 1e6, "The maximum number of time series, which could be scanned when searching for the the matching time series "+
+		"at /api/v1/labels and /api/v1/label/.../values. This option allows limiting memory usage and CPU usage. See also -search.maxLabelsAPIDuration, "+
+		"-search.maxTagKeys, -search.maxTagValues and -search.ignoreExtraFiltersAtLabelsAPI")
 	maxPointsPerTimeseries = flag.Int("search.maxPointsPerTimeseries", 30e3, "The maximum points per a single timeseries returned from /api/v1/query_range. "+
 		"This option doesn't limit the number of scanned raw samples in the database. The main purpose of this option is to limit the number of per-series points "+
-		"returned to graphing UI such as VMUI or Grafana. There is no sense in setting this limit to values bigger than the horizontal resolution of the graph")
+		"returned to graphing UI such as VMUI or Grafana. There is no sense in setting this limit to values bigger than the horizontal resolution of the graph. "+
+		"See also -search.maxResponseSeries")
+	ignoreExtraFiltersAtLabelsAPI = flag.Bool("search.ignoreExtraFiltersAtLabelsAPI", false, "Whether to ignore match[], extra_filters[] and extra_label query args at "+
+		"/api/v1/labels and /api/v1/label/.../values . This may be useful for decreasing load on VictoriaMetrics when extra filters "+
+		"match too many time series. The downside is that suprflouos labels or series could be returned, which do not match the extra filters. "+
+		"See also -search.maxLabelsAPISeries and -search.maxLabelsAPIDuration")
 )
 
 // Default step used if not set.
 const defaultStep = 5 * 60 * 1000
+
+// ExpandWithExprs handles the request to /expand-with-exprs
+func ExpandWithExprs(w http.ResponseWriter, r *http.Request) {
+	query := r.FormValue("query")
+	format := r.FormValue("format")
+	bw := bufferedwriter.Get(w)
+	defer bufferedwriter.Put(bw)
+	if format == "json" {
+		w.Header().Set("Content-Type", "application/json")
+		httpserver.EnableCORS(w, r)
+		WriteExpandWithExprsJSONResponse(bw, query)
+	} else {
+		WriteExpandWithExprsResponse(bw, query)
+	}
+	_ = bw.Flush()
+}
+
+// PrettifyQuery handles the request /prettify-query
+func PrettifyQuery(w http.ResponseWriter, r *http.Request) {
+	query := r.FormValue("query")
+	bw := bufferedwriter.Get(w)
+	defer bufferedwriter.Put(bw)
+	w.Header().Set("Content-Type", "application/json")
+	httpserver.EnableCORS(w, r)
+
+	prettyQuery, err := metricsql.Prettify(query)
+	if err != nil {
+		fmt.Fprintf(bw, `{"status": "error", "msg": %q}`, err)
+	} else {
+		fmt.Fprintf(bw, `{"status": "success", "query": %q}`, prettyQuery)
+	}
+	_ = bw.Flush()
+}
 
 // FederateHandler implements /federate . See https://prometheus.io/docs/prometheus/latest/federation/
 func FederateHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
@@ -115,7 +159,7 @@ func ExportCSVHandler(startTime time.Time, w http.ResponseWriter, r *http.Reques
 		return fmt.Errorf("missing `format` arg; see https://docs.victoriametrics.com/#how-to-export-csv-data")
 	}
 	fieldNames := strings.Split(format, ",")
-	reduceMemUsage := searchutils.GetBool(r, "reduce_mem_usage")
+	reduceMemUsage := httputils.GetBool(r, "reduce_mem_usage")
 
 	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxExportSeries)
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
@@ -161,7 +205,7 @@ func ExportCSVHandler(startTime time.Time, w http.ResponseWriter, r *http.Reques
 					return err
 				}
 				if err := b.UnmarshalData(); err != nil {
-					return fmt.Errorf("cannot unmarshal block during export: %s", err)
+					return fmt.Errorf("cannot unmarshal block during export: %w", err)
 				}
 				xb := exportBlockPool.Get().(*exportBlock)
 				xb.mn = mn
@@ -252,7 +296,7 @@ func ExportHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) 
 	}
 	format := r.FormValue("format")
 	maxRowsPerLine := int(fastfloat.ParseInt64BestEffort(r.FormValue("max_rows_per_line")))
-	reduceMemUsage := searchutils.GetBool(r, "reduce_mem_usage")
+	reduceMemUsage := httputils.GetBool(r, "reduce_mem_usage")
 	if err := exportHandler(nil, w, cp, format, maxRowsPerLine, reduceMemUsage); err != nil {
 		return fmt.Errorf("error when exporting data on the time range (start=%d, end=%d): %w", cp.start, cp.end, err)
 	}
@@ -280,19 +324,21 @@ func exportHandler(qt *querytracer.Tracer, w http.ResponseWriter, cp *commonPara
 		}
 	} else if format == "promapi" {
 		WriteExportPromAPIHeader(bw)
-		firstLineOnce := uint32(0)
-		firstLineSent := uint32(0)
+		var firstLineOnce atomic.Bool
+		var firstLineSent atomic.Bool
 		writeLineFunc = func(xb *exportBlock, workerID uint) error {
 			bb := sw.getBuffer(workerID)
-			if atomic.CompareAndSwapUint32(&firstLineOnce, 0, 1) {
+			// Use Load() in front of CompareAndSwap() in order to avoid slow inter-CPU synchronization
+			// in fast path after the first line has been already sent.
+			if !firstLineOnce.Load() && firstLineOnce.CompareAndSwap(false, true) {
 				// Send the first line to sw.bw
 				WriteExportPromAPILine(bb, xb)
 				_, err := sw.bw.Write(bb.B)
 				bb.Reset()
-				atomic.StoreUint32(&firstLineSent, 1)
+				firstLineSent.Store(true)
 				return err
 			}
-			for atomic.LoadUint32(&firstLineSent) == 0 {
+			for !firstLineSent.Load() {
 				// Busy wait until the first line is sent to sw.bw
 				runtime.Gosched()
 			}
@@ -371,7 +417,7 @@ func exportHandler(qt *querytracer.Tracer, w http.ResponseWriter, cp *commonPara
 					return err
 				}
 				if err := b.UnmarshalData(); err != nil {
-					return fmt.Errorf("cannot unmarshal block during export: %s", err)
+					return fmt.Errorf("cannot unmarshal block during export: %w", err)
 				}
 				xb := exportBlockPool.Get().(*exportBlock)
 				xb.mn = mn
@@ -399,10 +445,7 @@ func exportHandler(qt *querytracer.Tracer, w http.ResponseWriter, cp *commonPara
 	if format == "promapi" {
 		WriteExportPromAPIFooter(bw, qt)
 	}
-	if err := bw.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return bw.Flush()
 }
 
 type exportBlock struct {
@@ -455,15 +498,15 @@ var deleteDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/
 func LabelValuesHandler(qt *querytracer.Tracer, startTime time.Time, labelName string, w http.ResponseWriter, r *http.Request) error {
 	defer labelValuesDuration.UpdateDuration(startTime)
 
-	cp, err := getCommonParamsWithDefaultDuration(r, startTime, false)
+	cp, err := getCommonParamsForLabelsAPI(r, startTime, false)
 	if err != nil {
 		return err
 	}
-	limit, err := searchutils.GetInt(r, "limit")
+	limit, err := httputils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
-	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxUniqueTimeseries)
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxLabelsAPISeries)
 	labelValues, err := netstorage.LabelValues(qt, labelName, sq, limit, cp.deadline)
 	if err != nil {
 		return fmt.Errorf("cannot obtain values for label %q: %w", labelName, err)
@@ -552,15 +595,15 @@ var tsdbStatusDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/
 func LabelsHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer labelsDuration.UpdateDuration(startTime)
 
-	cp, err := getCommonParamsWithDefaultDuration(r, startTime, false)
+	cp, err := getCommonParamsForLabelsAPI(r, startTime, false)
 	if err != nil {
 		return err
 	}
-	limit, err := searchutils.GetInt(r, "limit")
+	limit, err := httputils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
-	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxUniqueTimeseries)
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxLabelsAPISeries)
 	labels, err := netstorage.LabelNames(qt, sq, limit, cp.deadline)
 	if err != nil {
 		return fmt.Errorf("cannot obtain labels: %w", err)
@@ -605,25 +648,21 @@ var seriesCountDuration = metrics.NewSummary(`vm_request_duration_seconds{path="
 func SeriesHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	defer seriesDuration.UpdateDuration(startTime)
 
-	// Do not set start to searchutils.minTimeMsecs by default as Prometheus does,
+	// Do not set start to httputils.minTimeMsecs by default as Prometheus does,
 	// since this leads to fetching and scanning all the data from the storage,
 	// which can take a lot of time for big storages.
 	// It is better setting start as end-defaultStep by default.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/91
-	cp, err := getCommonParamsWithDefaultDuration(r, startTime, true)
+	cp, err := getCommonParamsForLabelsAPI(r, startTime, true)
 	if err != nil {
 		return err
 	}
-	limit, err := searchutils.GetInt(r, "limit")
+	limit, err := httputils.GetInt(r, "limit")
 	if err != nil {
 		return err
 	}
 
-	minLimit := *maxSeriesLimit
-	if limit > 0 && limit < *maxSeriesLimit {
-		minLimit = limit
-	}
-	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, minLimit)
+	sq := storage.NewSearchQuery(cp.start, cp.end, cp.filterss, *maxSeriesLimit)
 	metricNames, err := netstorage.SearchMetricNames(qt, sq, cp.deadline)
 	if err != nil {
 		return fmt.Errorf("cannot fetch time series for %q: %w", sq, err)
@@ -638,10 +677,7 @@ func SeriesHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseW
 		qt.Donef("start=%d, end=%d", cp.start, cp.end)
 	}
 	WriteSeriesResponse(bw, metricNames, qt, qtDone)
-	if err := bw.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return bw.Flush()
 }
 
 var seriesDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/series"}`)
@@ -654,12 +690,12 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 
 	ct := startTime.UnixNano() / 1e6
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	mayCache := !searchutils.GetBool(r, "nocache")
+	mayCache := !httputils.GetBool(r, "nocache")
 	query := r.FormValue("query")
 	if len(query) == 0 {
 		return fmt.Errorf("missing `query` arg")
 	}
-	start, err := searchutils.GetTime(r, "time", ct)
+	start, err := httputils.GetTime(r, "time", ct)
 	if err != nil {
 		return err
 	}
@@ -667,7 +703,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 	if err != nil {
 		return err
 	}
-	step, err := searchutils.GetDuration(r, "step", lookbackDelta)
+	step, err := httputils.GetDuration(r, "step", lookbackDelta)
 	if err != nil {
 		return err
 	}
@@ -675,7 +711,7 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		step = defaultStep
 	}
 
-	if len(query) > maxQueryLen.N {
+	if len(query) > maxQueryLen.IntN() {
 		return fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxQueryLen.N)
 	}
 	etfs, err := searchutils.GetExtraTagFilters(r)
@@ -683,7 +719,10 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		return err
 	}
 	if childQuery, windowExpr, offsetExpr := promql.IsMetricSelectorWithRollup(query); childQuery != "" {
-		window := windowExpr.Duration(step)
+		window, err := windowExpr.NonNegativeDuration(step)
+		if err != nil {
+			return fmt.Errorf("cannot parse lookbehind window in square brackets at %s: %w", query, err)
+		}
 		offset := offsetExpr.Duration(step)
 		start -= offset
 		end := start
@@ -709,15 +748,20 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		if err := exportHandler(qt, w, cp, "promapi", 0, false); err != nil {
 			return fmt.Errorf("error when exporting data for query=%q on the time range (start=%d, end=%d): %w", childQuery, start, end, err)
 		}
-		queryDuration.UpdateDuration(startTime)
 		return nil
 	}
 	if childQuery, windowExpr, stepExpr, offsetExpr := promql.IsRollup(query); childQuery != "" {
-		newStep := stepExpr.Duration(step)
+		newStep, err := stepExpr.NonNegativeDuration(step)
+		if err != nil {
+			return fmt.Errorf("cannot parse step in square brackets at %s: %w", query, err)
+		}
 		if newStep > 0 {
 			step = newStep
 		}
-		window := windowExpr.Duration(step)
+		window, err := windowExpr.NonNegativeDuration(step)
+		if err != nil {
+			return fmt.Errorf("cannot parse lookbehind window in square brackets at %s: %w", query, err)
+		}
 		offset := offsetExpr.Duration(step)
 		start -= offset
 		end := start
@@ -725,12 +769,14 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		if err := queryRangeHandler(qt, startTime, w, childQuery, start, end, step, r, ct, etfs); err != nil {
 			return fmt.Errorf("error when executing query=%q on the time range (start=%d, end=%d, step=%d): %w", childQuery, start, end, step, err)
 		}
-		queryDuration.UpdateDuration(startTime)
 		return nil
 	}
 
-	queryOffset := getLatencyOffsetMilliseconds()
-	if !searchutils.GetBool(r, "nocache") && ct-start < queryOffset && start-ct < queryOffset {
+	queryOffset, err := getLatencyOffsetMilliseconds(r)
+	if err != nil {
+		return err
+	}
+	if !httputils.GetBool(r, "nocache") && ct-start < queryOffset && start-ct < queryOffset {
 		// Adjust start time only if `nocache` arg isn't set.
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/241
 		startPrev := start
@@ -739,7 +785,8 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 	} else {
 		queryOffset = 0
 	}
-	ec := promql.EvalConfig{
+	qs := &promql.QueryStats{}
+	ec := &promql.EvalConfig{
 		Start:               start,
 		End:                 start,
 		Step:                step,
@@ -751,17 +798,26 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 		LookbackDelta:       lookbackDelta,
 		RoundDigits:         getRoundDigits(r),
 		EnforcedTagFilterss: etfs,
+		GetRequestURI: func() string {
+			return httpserver.GetRequestURI(r)
+		},
+
+		QueryStats: qs,
 	}
-	result, err := promql.Exec(qt, &ec, query, true)
+	result, err := promql.Exec(qt, ec, query, true)
 	if err != nil {
 		return fmt.Errorf("error when executing query=%q for (time=%d, step=%d): %w", query, start, step, err)
 	}
 	if queryOffset > 0 {
 		for i := range result {
-			timestamps := result[i].Timestamps
+			r := &result[i]
+			// Do not modify r.Timestamps, since they may be shared among multiple series.
+			// Make a copy instead.
+			timestamps := append([]int64{}, r.Timestamps...)
 			for j := range timestamps {
 				timestamps[j] += queryOffset
 			}
+			r.Timestamps = timestamps
 		}
 	}
 
@@ -771,7 +827,8 @@ func QueryHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWr
 	qtDone := func() {
 		qt.Donef("query=%s, time=%d: series=%d", query, start, len(result))
 	}
-	WriteQueryResponse(bw, result, qt, qtDone)
+
+	WriteQueryResponse(bw, result, qt, qtDone, qs)
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("cannot flush query response to remote client: %w", err)
 	}
@@ -791,15 +848,15 @@ func QueryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 	if len(query) == 0 {
 		return fmt.Errorf("missing `query` arg")
 	}
-	start, err := searchutils.GetTime(r, "start", ct-defaultStep)
+	start, err := httputils.GetTime(r, "start", ct-defaultStep)
 	if err != nil {
 		return err
 	}
-	end, err := searchutils.GetTime(r, "end", ct)
+	end, err := httputils.GetTime(r, "end", ct)
 	if err != nil {
 		return err
 	}
-	step, err := searchutils.GetDuration(r, "step", defaultStep)
+	step, err := httputils.GetDuration(r, "step", defaultStep)
 	if err != nil {
 		return err
 	}
@@ -816,14 +873,14 @@ func QueryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.ResponseWriter, query string,
 	start, end, step int64, r *http.Request, ct int64, etfs [][]storage.TagFilter) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	mayCache := !searchutils.GetBool(r, "nocache")
+	mayCache := !httputils.GetBool(r, "nocache")
 	lookbackDelta, err := getMaxLookback(r)
 	if err != nil {
 		return err
 	}
 
 	// Validate input args.
-	if len(query) > maxQueryLen.N {
+	if len(query) > maxQueryLen.IntN() {
 		return fmt.Errorf("too long query; got %d bytes; mustn't exceed `-search.maxQueryLen=%d` bytes", len(query), maxQueryLen.N)
 	}
 	if start > end {
@@ -836,7 +893,8 @@ func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 		start, end = promql.AdjustStartEnd(start, end, step)
 	}
 
-	ec := promql.EvalConfig{
+	qs := &promql.QueryStats{}
+	ec := &promql.EvalConfig{
 		Start:               start,
 		End:                 end,
 		Step:                step,
@@ -848,13 +906,21 @@ func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 		LookbackDelta:       lookbackDelta,
 		RoundDigits:         getRoundDigits(r),
 		EnforcedTagFilterss: etfs,
+		GetRequestURI: func() string {
+			return httpserver.GetRequestURI(r)
+		},
+
+		QueryStats: qs,
 	}
-	result, err := promql.Exec(qt, &ec, query, false)
+	result, err := promql.Exec(qt, ec, query, false)
 	if err != nil {
 		return err
 	}
 	if step < maxStepForPointsAdjustment.Milliseconds() {
-		queryOffset := getLatencyOffsetMilliseconds()
+		queryOffset, err := getLatencyOffsetMilliseconds(r)
+		if err != nil {
+			return err
+		}
 		if ct-queryOffset < end {
 			result = adjustLastPoints(result, ct-queryOffset, ct+step)
 		}
@@ -870,7 +936,7 @@ func queryRangeHandler(qt *querytracer.Tracer, startTime time.Time, w http.Respo
 	qtDone := func() {
 		qt.Donef("start=%d, end=%d, step=%d, query=%q: series=%d", start, end, step, query, len(result))
 	}
-	WriteQueryRangeResponse(bw, result, qt, qtDone)
+	WriteQueryRangeResponse(bw, result, qt, qtDone, qs)
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("cannot send query range response to remote client: %w", err)
 	}
@@ -899,7 +965,9 @@ func removeEmptyValuesAndTimeseries(tss []netstorage.Result) []netstorage.Result
 		// Slow path: remove NaNs.
 		srcTimestamps := ts.Timestamps
 		dstValues := ts.Values[:0]
-		dstTimestamps := ts.Timestamps[:0]
+		// Do not re-use ts.Timestamps for dstTimestamps, since ts.Timestamps
+		// may be shared among multiple time series.
+		dstTimestamps := make([]int64, 0, len(ts.Timestamps))
 		for j, v := range ts.Values {
 			if math.IsNaN(v) {
 				continue
@@ -955,13 +1023,13 @@ func getMaxLookback(r *http.Request) (int64, error) {
 	if d == 0 {
 		d = maxStalenessInterval.Milliseconds()
 	}
-	maxLookback, err := searchutils.GetDuration(r, "max_lookback", d)
+	maxLookback, err := httputils.GetDuration(r, "max_lookback", d)
 	if err != nil {
 		return 0, err
 	}
 	d = maxLookback
 	if *setLookbackToStep {
-		step, err := searchutils.GetDuration(r, "step", d)
+		step, err := httputils.GetDuration(r, "step", d)
 		if err != nil {
 			return 0, err
 		}
@@ -971,15 +1039,15 @@ func getMaxLookback(r *http.Request) (int64, error) {
 }
 
 func getTagFilterssFromMatches(matches []string) ([][]storage.TagFilter, error) {
-	tagFilterss := make([][]storage.TagFilter, 0, len(matches))
+	tfss := make([][]storage.TagFilter, 0, len(matches))
 	for _, match := range matches {
-		tagFilters, err := searchutils.ParseMetricSelector(match)
+		tfssLocal, err := searchutils.ParseMetricSelector(match)
 		if err != nil {
 			return nil, fmt.Errorf("cannot parse matches[]=%s: %w", match, err)
 		}
-		tagFilterss = append(tagFilterss, tagFilters)
+		tfss = append(tfss, tfssLocal...)
 	}
-	return tagFilterss, nil
+	return tfss, nil
 }
 
 func getRoundDigits(r *http.Request) int {
@@ -994,18 +1062,18 @@ func getRoundDigits(r *http.Request) int {
 	return n
 }
 
-func getLatencyOffsetMilliseconds() int64 {
+func getLatencyOffsetMilliseconds(r *http.Request) (int64, error) {
 	d := latencyOffset.Milliseconds()
-	if d <= 1000 {
-		d = 1000
+	if d < 0 {
+		// Zero latency offset may be useful for some use cases.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2061#issuecomment-1299109836
+		d = 0
 	}
-	return d
+	return httputils.GetDuration(r, "latency_offset", d)
 }
 
 // QueryStatsHandler returns query stats at `/api/v1/status/top_queries`
-func QueryStatsHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
-	defer queryStatsDuration.UpdateDuration(startTime)
-
+func QueryStatsHandler(w http.ResponseWriter, r *http.Request) error {
 	topN := 20
 	topNStr := r.FormValue("topN")
 	if len(topNStr) > 0 {
@@ -1015,7 +1083,7 @@ func QueryStatsHandler(startTime time.Time, w http.ResponseWriter, r *http.Reque
 		}
 		topN = n
 	}
-	maxLifetimeMsecs, err := searchutils.GetDuration(r, "maxLifetime", 10*60*1000)
+	maxLifetimeMsecs, err := httputils.GetDuration(r, "maxLifetime", 10*60*1000)
 	if err != nil {
 		return fmt.Errorf("cannot parse `maxLifetime` arg: %w", err)
 	}
@@ -1029,8 +1097,6 @@ func QueryStatsHandler(startTime time.Time, w http.ResponseWriter, r *http.Reque
 	}
 	return nil
 }
-
-var queryStatsDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/status/top_queries"}`)
 
 // commonParams contains common parameters for all /api/v1/* handlers
 //
@@ -1064,14 +1130,15 @@ func getExportParams(r *http.Request, startTime time.Time) (*commonParams, error
 	return cp, nil
 }
 
-func getCommonParamsWithDefaultDuration(r *http.Request, startTime time.Time, requireNonEmptyMatch bool) (*commonParams, error) {
-	cp, err := getCommonParams(r, startTime, requireNonEmptyMatch)
+func getCommonParamsForLabelsAPI(r *http.Request, startTime time.Time, requireNonEmptyMatch bool) (*commonParams, error) {
+	cp, err := getCommonParamsInternal(r, startTime, requireNonEmptyMatch, true)
 	if err != nil {
 		return nil, err
 	}
 	if cp.start == 0 {
 		cp.start = cp.end - defaultStep
 	}
+	cp.deadline = searchutils.GetDeadlineForExport(r, startTime)
 	return cp, nil
 }
 
@@ -1084,13 +1151,17 @@ func getCommonParamsWithDefaultDuration(r *http.Request, startTime time.Time, re
 // - extra_label
 // - extra_filters[]
 func getCommonParams(r *http.Request, startTime time.Time, requireNonEmptyMatch bool) (*commonParams, error) {
+	return getCommonParamsInternal(r, startTime, requireNonEmptyMatch, false)
+}
+
+func getCommonParamsInternal(r *http.Request, startTime time.Time, requireNonEmptyMatch, isLabelsAPI bool) (*commonParams, error) {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
-	start, err := searchutils.GetTime(r, "start", 0)
+	start, err := httputils.GetTime(r, "start", 0)
 	if err != nil {
 		return nil, err
 	}
 	ct := startTime.UnixNano() / 1e6
-	end, err := searchutils.GetTime(r, "end", ct)
+	end, err := httputils.GetTime(r, "end", ct)
 	if err != nil {
 		return nil, err
 	}
@@ -1110,15 +1181,20 @@ func getCommonParams(r *http.Request, startTime time.Time, requireNonEmptyMatch 
 	if requireNonEmptyMatch && len(matches) == 0 {
 		return nil, fmt.Errorf("missing `match[]` arg")
 	}
-	tagFilterss, err := getTagFilterssFromMatches(matches)
-	if err != nil {
-		return nil, err
+
+	var filterss [][]storage.TagFilter
+	if !isLabelsAPI || !*ignoreExtraFiltersAtLabelsAPI {
+		tagFilterss, err := getTagFilterssFromMatches(matches)
+		if err != nil {
+			return nil, err
+		}
+		etfs, err := searchutils.GetExtraTagFilters(r)
+		if err != nil {
+			return nil, err
+		}
+		filterss = searchutils.JoinTagFilterss(tagFilterss, etfs)
 	}
-	etfs, err := searchutils.GetExtraTagFilters(r)
-	if err != nil {
-		return nil, err
-	}
-	filterss := searchutils.JoinTagFilterss(tagFilterss, etfs)
+
 	cp := &commonParams{
 		deadline:         deadline,
 		start:            start,

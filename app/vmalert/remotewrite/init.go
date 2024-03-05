@@ -8,6 +8,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
 )
 
 var (
@@ -29,23 +30,25 @@ var (
 	bearerTokenFile = flag.String("remoteWrite.bearerTokenFile", "", "Optional path to bearer token file to use for -remoteWrite.url.")
 
 	maxQueueSize  = flag.Int("remoteWrite.maxQueueSize", 1e5, "Defines the max number of pending datapoints to remote write endpoint")
-	maxBatchSize  = flag.Int("remoteWrite.maxBatchSize", 1e3, "Defines defines max number of timeseries to be flushed at once")
-	concurrency   = flag.Int("remoteWrite.concurrency", 1, "Defines number of writers for concurrent writing into remote querier")
+	maxBatchSize  = flag.Int("remoteWrite.maxBatchSize", 1e3, "Defines max number of timeseries to be flushed at once")
+	concurrency   = flag.Int("remoteWrite.concurrency", 1, "Defines number of writers for concurrent writing into remote write endpoint")
 	flushInterval = flag.Duration("remoteWrite.flushInterval", 5*time.Second, "Defines interval of flushes to remote write endpoint")
 
 	tlsInsecureSkipVerify = flag.Bool("remoteWrite.tlsInsecureSkipVerify", false, "Whether to skip tls verification when connecting to -remoteWrite.url")
 	tlsCertFile           = flag.String("remoteWrite.tlsCertFile", "", "Optional path to client-side TLS certificate file to use when connecting to -remoteWrite.url")
 	tlsKeyFile            = flag.String("remoteWrite.tlsKeyFile", "", "Optional path to client-side TLS certificate key to use when connecting to -remoteWrite.url")
 	tlsCAFile             = flag.String("remoteWrite.tlsCAFile", "", "Optional path to TLS CA file to use for verifying connections to -remoteWrite.url. "+
-		"By default system CA is used")
+		"By default, system CA is used")
 	tlsServerName = flag.String("remoteWrite.tlsServerName", "", "Optional TLS server name to use for connections to -remoteWrite.url. "+
-		"By default the server name from -remoteWrite.url is used")
+		"By default, the server name from -remoteWrite.url is used")
 
-	oauth2ClientID         = flag.String("remoteWrite.oauth2.clientID", "", "Optional OAuth2 clientID to use for -remoteWrite.url.")
-	oauth2ClientSecret     = flag.String("remoteWrite.oauth2.clientSecret", "", "Optional OAuth2 clientSecret to use for -remoteWrite.url.")
-	oauth2ClientSecretFile = flag.String("remoteWrite.oauth2.clientSecretFile", "", "Optional OAuth2 clientSecretFile to use for -remoteWrite.url.")
-	oauth2TokenURL         = flag.String("remoteWrite.oauth2.tokenUrl", "", "Optional OAuth2 tokenURL to use for -notifier.url.")
-	oauth2Scopes           = flag.String("remoteWrite.oauth2.scopes", "", "Optional OAuth2 scopes to use for -notifier.url. Scopes must be delimited by ';'.")
+	oauth2ClientID         = flag.String("remoteWrite.oauth2.clientID", "", "Optional OAuth2 clientID to use for -remoteWrite.url")
+	oauth2ClientSecret     = flag.String("remoteWrite.oauth2.clientSecret", "", "Optional OAuth2 clientSecret to use for -remoteWrite.url")
+	oauth2ClientSecretFile = flag.String("remoteWrite.oauth2.clientSecretFile", "", "Optional OAuth2 clientSecretFile to use for -remoteWrite.url")
+	oauth2EndpointParams   = flag.String("remoteWrite.oauth2.endpointParams", "", "Optional OAuth2 endpoint parameters to use for -remoteWrite.url . "+
+		`The endpoint parameters must be set in JSON format: {"param1":"value1",...,"paramN":"valueN"}`)
+	oauth2TokenURL = flag.String("remoteWrite.oauth2.tokenUrl", "", "Optional OAuth2 tokenURL to use for -notifier.url.")
+	oauth2Scopes   = flag.String("remoteWrite.oauth2.scopes", "", "Optional OAuth2 scopes to use for -notifier.url. Scopes must be delimited by ';'.")
 )
 
 // InitSecretFlags must be called after flag.Parse and before any logging
@@ -62,28 +65,31 @@ func Init(ctx context.Context) (*Client, error) {
 		return nil, nil
 	}
 
-	t, err := utils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
+	t, err := httputils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
 
+	endpointParams, err := flagutil.ParseJSONMap(*oauth2EndpointParams)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse JSON for -remoteWrite.oauth2.endpointParams=%s: %w", *oauth2EndpointParams, err)
+	}
 	authCfg, err := utils.AuthConfig(
 		utils.WithBasicAuth(*basicAuthUsername, *basicAuthPassword, *basicAuthPasswordFile),
 		utils.WithBearer(*bearerToken, *bearerTokenFile),
-		utils.WithOAuth(*oauth2ClientID, *oauth2ClientSecret, *oauth2ClientSecretFile, *oauth2TokenURL, *oauth2Scopes),
+		utils.WithOAuth(*oauth2ClientID, *oauth2ClientSecret, *oauth2ClientSecretFile, *oauth2TokenURL, *oauth2Scopes, endpointParams),
 		utils.WithHeaders(*headers))
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure auth: %w", err)
 	}
 
 	return NewClient(ctx, Config{
-		Addr:              *addr,
-		AuthCfg:           authCfg,
-		Concurrency:       *concurrency,
-		MaxQueueSize:      *maxQueueSize,
-		MaxBatchSize:      *maxBatchSize,
-		FlushInterval:     *flushInterval,
-		DisablePathAppend: *disablePathAppend,
-		Transport:         t,
+		Addr:          *addr,
+		AuthCfg:       authCfg,
+		Concurrency:   *concurrency,
+		MaxQueueSize:  *maxQueueSize,
+		MaxBatchSize:  *maxBatchSize,
+		FlushInterval: *flushInterval,
+		Transport:     t,
 	})
 }

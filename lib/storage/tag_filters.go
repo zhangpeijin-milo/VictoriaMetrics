@@ -16,6 +16,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/lrucache"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/regexutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/stringsutil"
 )
 
 // convertToCompositeTagFilterss converts tfss to composite filters.
@@ -57,7 +58,7 @@ func convertToCompositeTagFilters(tfs *TagFilters) []*TagFilters {
 	// then it is impossible to construct composite tag filter.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2238
 	if len(names) == 0 || !hasPositiveFilter {
-		atomic.AddUint64(&compositeFilterMissingConversions, 1)
+		compositeFilterMissingConversions.Add(1)
 		return []*TagFilters{tfs}
 	}
 
@@ -116,20 +117,20 @@ func convertToCompositeTagFilters(tfs *TagFilters) []*TagFilters {
 		if compositeFilters == 0 {
 			// Cannot use tfsNew, since it doesn't contain composite filters, e.g. it may match broader set of series.
 			// Fall back to the original tfs.
-			atomic.AddUint64(&compositeFilterMissingConversions, 1)
+			compositeFilterMissingConversions.Add(1)
 			return []*TagFilters{tfs}
 		}
 		tfsCompiled := NewTagFilters()
 		tfsCompiled.tfs = tfsNew
 		tfssCompiled = append(tfssCompiled, tfsCompiled)
 	}
-	atomic.AddUint64(&compositeFilterSuccessConversions, 1)
+	compositeFilterSuccessConversions.Add(1)
 	return tfssCompiled
 }
 
 var (
-	compositeFilterSuccessConversions uint64
-	compositeFilterMissingConversions uint64
+	compositeFilterSuccessConversions atomic.Uint64
+	compositeFilterMissingConversions atomic.Uint64
 )
 
 // TagFilters represents filters used for filtering tags.
@@ -293,7 +294,7 @@ func (tf *tagFilter) Less(other *tagFilter) bool {
 // String returns human-readable tf value.
 func (tf *tagFilter) String() string {
 	op := tf.getOp()
-	value := bytesutil.LimitStringLen(string(tf.value), 60)
+	value := stringsutil.LimitStringLen(string(tf.value), 60)
 	if bytes.Equal(tf.key, graphiteReverseTagKey) {
 		return fmt.Sprintf("__graphite_reverse__%s%q", op, value)
 	}

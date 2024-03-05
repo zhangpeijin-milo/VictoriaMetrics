@@ -2,18 +2,20 @@ package promrelabel
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
-func TestSanitizeName(t *testing.T) {
+func TestSanitizeMetricName(t *testing.T) {
 	f := func(s, resultExpected string) {
 		t.Helper()
 		for i := 0; i < 5; i++ {
-			result := SanitizeName(s)
+			result := SanitizeMetricName(s)
 			if result != resultExpected {
-				t.Fatalf("unexpected result for SanitizeName(%q) at iteration %d; got %q; want %q", s, i, result, resultExpected)
+				t.Fatalf("unexpected result for SanitizeMetricName(%q) at iteration %d; got %q; want %q", s, i, result, resultExpected)
 			}
 		}
 	}
@@ -23,10 +25,26 @@ func TestSanitizeName(t *testing.T) {
 	f("foo...bar", "foo___bar")
 }
 
+func TestSanitizeLabelName(t *testing.T) {
+	f := func(s, resultExpected string) {
+		t.Helper()
+		for i := 0; i < 5; i++ {
+			result := SanitizeLabelName(s)
+			if result != resultExpected {
+				t.Fatalf("unexpected result for SanitizeLabelName(%q) at iteration %d; got %q; want %q", s, i, result, resultExpected)
+			}
+		}
+	}
+	f("", "")
+	f("a", "a")
+	f("foo.bar/baz:a", "foo_bar_baz_a")
+	f("foo...bar", "foo___bar")
+}
+
 func TestLabelsToString(t *testing.T) {
 	f := func(labels []prompbmarshal.Label, sExpected string) {
 		t.Helper()
-		s := labelsToString(labels)
+		s := LabelsToString(labels)
 		if s != sExpected {
 			t.Fatalf("unexpected result;\ngot\n%s\nwant\n%s", s, sExpected)
 		}
@@ -70,20 +88,95 @@ func TestLabelsToString(t *testing.T) {
 	}, `xxx{a="bc",foo="bar"}`)
 }
 
-func TestApplyRelabelConfigs(t *testing.T) {
-	f := func(config, metric string, isFinalize bool, resultExpected string) {
+func TestParsedRelabelConfigsApplyDebug(t *testing.T) {
+	f := func(config, metric string, dssExpected []DebugStep) {
 		t.Helper()
-		pcs, err := ParseRelabelConfigsData([]byte(config), false)
+		pcs, err := ParseRelabelConfigsData([]byte(config))
 		if err != nil {
 			t.Fatalf("cannot parse %q: %s", config, err)
 		}
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := pcs.Apply(labels, 0)
+		labels := promutils.MustNewLabelsFromString(metric)
+		_, dss := pcs.ApplyDebug(labels.GetLabels())
+		if !reflect.DeepEqual(dss, dssExpected) {
+			t.Fatalf("unexpected result; got\n%s\nwant\n%s", dss, dssExpected)
+		}
+	}
+
+	// empty relabel config
+	f(``, `foo`, nil)
+	// add label
+	f(`
+- target_label: abc
+  replacement: xyz
+`, `foo{bar="baz"}`, []DebugStep{
+		{
+			Rule: "target_label: abc\nreplacement: xyz\n",
+			In:   `foo{bar="baz"}`,
+			Out:  `foo{abc="xyz",bar="baz"}`,
+		},
+	})
+	// drop label
+	f(`
+- target_label: bar
+  replacement: ''
+`, `foo{bar="baz"}`, []DebugStep{
+		{
+			Rule: "target_label: bar\nreplacement: \"\"\n",
+			In:   `foo{bar="baz"}`,
+			Out:  `foo{bar=""}`,
+		},
+		{
+			Rule: "remove empty labels",
+			In:   `foo{bar=""}`,
+			Out:  `foo`,
+		},
+	})
+	// drop metric
+	f(`
+- action: drop
+  source_labels: [bar]
+  regex: baz
+`, `foo{bar="baz",abc="def"}`, []DebugStep{
+		{
+			Rule: "action: drop\nsource_labels: [bar]\nregex: baz\n",
+			In:   `foo{abc="def",bar="baz"}`,
+			Out:  `{}`,
+		},
+	})
+	// Multiple steps
+	f(`
+- action: labeldrop
+  regex: "foo.*"
+- target_label: foobar
+  replacement: "abc"
+`, `m{foo="x",foobc="123",a="b"}`, []DebugStep{
+		{
+			Rule: "action: labeldrop\nregex: foo.*\n",
+			In:   `m{a="b",foo="x",foobc="123"}`,
+			Out:  `m{a="b"}`,
+		},
+		{
+			Rule: "target_label: foobar\nreplacement: abc\n",
+			In:   `m{a="b"}`,
+			Out:  `m{a="b",foobar="abc"}`,
+		},
+	})
+}
+
+func TestParsedRelabelConfigsApply(t *testing.T) {
+	f := func(config, metric string, isFinalize bool, resultExpected string) {
+		t.Helper()
+		pcs, err := ParseRelabelConfigsData([]byte(config))
+		if err != nil {
+			t.Fatalf("cannot parse %q: %s", config, err)
+		}
+		labels := promutils.MustNewLabelsFromString(metric)
+		resultLabels := pcs.Apply(labels.GetLabels(), 0)
 		if isFinalize {
 			resultLabels = FinalizeLabels(resultLabels[:0], resultLabels)
 		}
 		SortLabels(resultLabels)
-		result := labelsToString(resultLabels)
+		result := LabelsToString(resultLabels)
 		if result != resultExpected {
 			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
 		}
@@ -291,6 +384,104 @@ func TestApplyRelabelConfigs(t *testing.T) {
   replacement: "foobar"
 `, `{}`, true, `{foo="foobar"}`)
 	})
+	t.Run("keep_if_contains-non-existing-target-and-source", func(t *testing.T) {
+		f(`
+- action: keep_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{x="y"}`, true, `{x="y"}`)
+	})
+	t.Run("keep_if_contains-non-existing-target", func(t *testing.T) {
+		f(`
+- action: keep_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{bar="aaa"}`, true, `{}`)
+	})
+	t.Run("keep_if_contains-non-existing-source", func(t *testing.T) {
+		f(`
+- action: keep_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{foo="aaa"}`, true, `{foo="aaa"}`)
+	})
+	t.Run("keep_if_contains-matching-source-target", func(t *testing.T) {
+		f(`
+- action: keep_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{bar="aaa",foo="aaa"}`, true, `{bar="aaa",foo="aaa"}`)
+	})
+	t.Run("keep_if_contains-matching-sources-target", func(t *testing.T) {
+		f(`
+- action: keep_if_contains
+  target_label: foo
+  source_labels: [bar, baz]
+`, `{bar="aaa",foo="aaa",baz="aaa"}`, true, `{bar="aaa",baz="aaa",foo="aaa"}`)
+	})
+	t.Run("keep_if_contains-mismatching-source-target", func(t *testing.T) {
+		f(`
+- action: keep_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{bar="aaa",foo="bbb"}`, true, `{}`)
+	})
+	t.Run("keep_if_contains-mismatching-sources-target", func(t *testing.T) {
+		f(`
+- action: keep_if_contains
+  target_label: foo
+  source_labels: [bar, baz]
+`, `{bar="aaa",foo="aaa",baz="bbb"}`, true, `{}`)
+	})
+	t.Run("drop_if_contains-non-existing-target-and-source", func(t *testing.T) {
+		f(`
+- action: drop_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{x="y"}`, true, `{}`)
+	})
+	t.Run("drop_if_contains-non-existing-target", func(t *testing.T) {
+		f(`
+- action: drop_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{bar="aaa"}`, true, `{bar="aaa"}`)
+	})
+	t.Run("drop_if_contains-non-existing-source", func(t *testing.T) {
+		f(`
+- action: drop_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{foo="aaa"}`, true, `{}`)
+	})
+	t.Run("drop_if_contains-matching-source-target", func(t *testing.T) {
+		f(`
+- action: drop_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{bar="aaa",foo="aaa"}`, true, `{}`)
+	})
+	t.Run("drop_if_contains-matching-sources-target", func(t *testing.T) {
+		f(`
+- action: drop_if_contains
+  target_label: foo
+  source_labels: [bar, baz]
+`, `{bar="aaa",foo="aaa",baz="aaa"}`, true, `{}`)
+	})
+	t.Run("drop_if_contains-mismatching-source-target", func(t *testing.T) {
+		f(`
+- action: drop_if_contains
+  target_label: foo
+  source_labels: [bar]
+`, `{bar="aaa",foo="bbb"}`, true, `{bar="aaa",foo="bbb"}`)
+	})
+	t.Run("drop_if_contains-mismatching-sources-target", func(t *testing.T) {
+		f(`
+- action: drop_if_contains
+  target_label: foo
+  source_labels: [bar, baz]
+`, `{bar="aaa",foo="aaa",baz="bbb"}`, true, `{bar="aaa",baz="bbb",foo="aaa"}`)
+	})
 	t.Run("keep_if_equal-miss", func(t *testing.T) {
 		f(`
 - action: keep_if_equal
@@ -323,6 +514,34 @@ func TestApplyRelabelConfigs(t *testing.T) {
   source_labels: [xxx, bar]
 `, `{xxx="yyy",bar="yyy"}`, true, `{}`)
 	})
+	t.Run("keepequal-hit", func(t *testing.T) {
+		f(`
+- action: keepequal
+  source_labels: [foo]
+  target_label: bar
+`, `{foo="a",bar="a"}`, true, `{bar="a",foo="a"}`)
+	})
+	t.Run("keepequal-miss", func(t *testing.T) {
+		f(`
+- action: keepequal
+  source_labels: [foo]
+  target_label: bar
+`, `{foo="a",bar="x"}`, true, `{}`)
+	})
+	t.Run("dropequal-hit", func(t *testing.T) {
+		f(`
+- action: dropequal
+  source_labels: [foo]
+  target_label: bar
+`, `{foo="a",bar="a"}`, true, `{}`)
+	})
+	t.Run("dropequal-miss", func(t *testing.T) {
+		f(`
+- action: dropequal
+  source_labels: [foo]
+  target_label: bar
+`, `{foo="a",bar="x"}`, true, `{bar="x",foo="a"}`)
+	})
 	t.Run("keep-miss", func(t *testing.T) {
 		f(`
 - action: keep
@@ -344,7 +563,7 @@ func TestApplyRelabelConfigs(t *testing.T) {
 	t.Run("keep-if-hit", func(t *testing.T) {
 		f(`
 - action: keep
-  if: '{foo="yyy"}'
+  if: ['foobar', '{foo="yyy"}', '{a="b"}']
 `, `{foo="yyy"}`, false, `{foo="yyy"}`)
 	})
 	t.Run("keep-hit", func(t *testing.T) {
@@ -725,9 +944,9 @@ func TestApplyRelabelConfigs(t *testing.T) {
 func TestFinalizeLabels(t *testing.T) {
 	f := func(metric, resultExpected string) {
 		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := FinalizeLabels(nil, labels)
-		result := labelsToString(resultLabels)
+		labels := promutils.MustNewLabelsFromString(metric)
+		resultLabels := FinalizeLabels(nil, labels.GetLabels())
+		result := LabelsToString(resultLabels)
 		if result != resultExpected {
 			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
 		}
@@ -738,27 +957,11 @@ func TestFinalizeLabels(t *testing.T) {
 	f(`{foo="bar",abc="def",__address__="foo.com"}`, `{abc="def",foo="bar"}`)
 }
 
-func TestRemoveMetaLabels(t *testing.T) {
-	f := func(metric, resultExpected string) {
-		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := RemoveMetaLabels(nil, labels)
-		result := labelsToString(resultLabels)
-		if result != resultExpected {
-			t.Fatalf("unexpected result of RemoveMetaLabels;\ngot\n%s\nwant\n%s", result, resultExpected)
-		}
-	}
-	f(`{}`, `{}`)
-	f(`{foo="bar"}`, `{foo="bar"}`)
-	f(`{__meta_foo="bar"}`, `{}`)
-	f(`{__meta_foo="bdffr",foo="bar",__meta_xxx="basd"}`, `{foo="bar"}`)
-}
-
 func TestFillLabelReferences(t *testing.T) {
 	f := func(replacement, metric, resultExpected string) {
 		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		result := fillLabelReferences(nil, replacement, labels)
+		labels := promutils.MustNewLabelsFromString(metric)
+		result := fillLabelReferences(nil, replacement, labels.GetLabels())
 		if string(result) != resultExpected {
 			t.Fatalf("unexpected result; got\n%q\nwant\n%q", result, resultExpected)
 		}
@@ -822,7 +1025,53 @@ func newTestRegexRelabelConfig(pattern string) *parsedRelabelConfig {
 	}
 	prc, err := parseRelabelConfig(rc)
 	if err != nil {
-		panic(fmt.Errorf("unexpected error in parseRelabelConfig: %s", err))
+		panic(fmt.Errorf("unexpected error in parseRelabelConfig: %w", err))
 	}
 	return prc
+}
+
+func TestParsedRelabelConfigsApplyForMultipleSeries(t *testing.T) {
+	f := func(config string, metrics []string, resultExpected []string) {
+		t.Helper()
+		pcs, err := ParseRelabelConfigsData([]byte(config))
+		if err != nil {
+			t.Fatalf("cannot parse %q: %s", config, err)
+		}
+
+		totalLabels := 0
+		var labels []prompbmarshal.Label
+		for _, metric := range metrics {
+			labels = append(labels, promutils.MustNewLabelsFromString(metric).GetLabels()...)
+			resultLabels := pcs.Apply(labels, totalLabels)
+			SortLabels(resultLabels)
+			totalLabels += len(resultLabels)
+			labels = resultLabels
+		}
+
+		var result []string
+		for i := range labels {
+			result = append(result, LabelsToString(labels[i:i+1]))
+		}
+
+		if len(result) != len(resultExpected) {
+			t.Fatalf("unexpected number of results; got\n%q\nwant\n%q", result, resultExpected)
+		}
+
+		for i := range result {
+			if result[i] != resultExpected[i] {
+				t.Fatalf("unexpected result[%d]; got\n%q\nwant\n%q", i, result[i], resultExpected[i])
+			}
+		}
+	}
+
+	t.Run("drops one of series", func(t *testing.T) {
+		f(`
+- action: drop
+  if: '{__name__!~"smth"}' 
+`, []string{`smth`, `notthis`}, []string{`smth`})
+		f(`
+- action: drop
+  if: '{__name__!~"smth"}'
+`, []string{`notthis`, `smth`}, []string{`smth`})
+	})
 }

@@ -20,6 +20,8 @@ import (
 )
 
 var (
+	maxResponseSeries = flag.Int("search.maxResponseSeries", 0, "The maximum number of time series which can be returned from /api/v1/query and /api/v1/query_range . "+
+		"The limit is disabled if it equals to 0. See also -search.maxPointsPerTimeseries and -search.maxUniqueTimeseries")
 	treatDotsAsIsInRegexps = flag.Bool("search.treatDotsAsIsInRegexps", false, "Whether to treat dots as is in regexp label filters used in queries. "+
 		`For example, foo{bar=~"a.b.c"} will be automatically converted to foo{bar=~"a\\.b\\.c"}, i.e. all the dots in regexp filters will be automatically escaped `+
 		`in order to match only dot char instead of matching any char. Dots in ".+", ".*" and ".{n}" regexps aren't escaped. `+
@@ -48,7 +50,10 @@ func (ure *UserReadableError) Error() string {
 func Exec(qt *querytracer.Tracer, ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result, error) {
 	if querystats.Enabled() {
 		startTime := time.Now()
-		defer querystats.RegisterQuery(q, ec.End-ec.Start, startTime)
+		defer func() {
+			querystats.RegisterQuery(q, ec.End-ec.Start, startTime)
+			ec.QueryStats.addExecutionTimeMsec(startTime)
+		}()
 	}
 
 	ec.validate()
@@ -72,8 +77,12 @@ func Exec(qt *querytracer.Tracer, ec *EvalConfig, q string, isFirstPointOnly boo
 		}
 		qt.Printf("leave only the first point in every series")
 	}
-	maySort := maySortResults(e, rv)
+	maySort := maySortResults(e)
 	result, err := timeseriesToResult(rv, maySort)
+	if *maxResponseSeries > 0 && len(result) > *maxResponseSeries {
+		return nil, fmt.Errorf("the response contains more than -search.maxResponseSeries=%d time series: %d series; either increase -search.maxResponseSeries "+
+			"or change the query in order to return smaller number of series", *maxResponseSeries, len(result))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -94,13 +103,14 @@ func Exec(qt *querytracer.Tracer, ec *EvalConfig, q string, isFirstPointOnly boo
 	return result, nil
 }
 
-func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
+func maySortResults(e metricsql.Expr) bool {
 	switch v := e.(type) {
 	case *metricsql.FuncExpr:
 		switch strings.ToLower(v.Name) {
 		case "sort", "sort_desc",
 			"sort_by_label", "sort_by_label_desc",
 			"sort_by_label_numeric", "sort_by_label_numeric_desc":
+			// Results already sorted
 			return false
 		}
 	case *metricsql.AggrFuncExpr:
@@ -108,6 +118,13 @@ func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
 		case "topk", "bottomk", "outliersk",
 			"topk_max", "topk_min", "topk_avg", "topk_median", "topk_last",
 			"bottomk_max", "bottomk_min", "bottomk_avg", "bottomk_median", "bottomk_last":
+			// Results already sorted
+			return false
+		}
+	case *metricsql.BinaryOpExpr:
+		if strings.ToLower(v.Op) == "or" {
+			// Do not sort results for `a or b` in the same way as Prometheus does.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4763
 			return false
 		}
 	}
@@ -116,30 +133,37 @@ func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
 
 func timeseriesToResult(tss []*timeseries, maySort bool) ([]netstorage.Result, error) {
 	tss = removeEmptySeries(tss)
+	if maySort {
+		sortSeriesByMetricName(tss)
+	}
+
 	result := make([]netstorage.Result, len(tss))
 	m := make(map[string]struct{}, len(tss))
 	bb := bbPool.Get()
 	for i, ts := range tss {
 		bb.B = marshalMetricNameSorted(bb.B[:0], &ts.MetricName)
-		if _, ok := m[string(bb.B)]; ok {
+		k := string(bb.B)
+		if _, ok := m[k]; ok {
 			return nil, fmt.Errorf(`duplicate output timeseries: %s`, stringMetricName(&ts.MetricName))
 		}
-		m[string(bb.B)] = struct{}{}
+		m[k] = struct{}{}
 
 		rs := &result[i]
-		rs.MetricName.CopyFrom(&ts.MetricName)
-		rs.Values = append(rs.Values[:0], ts.Values...)
-		rs.Timestamps = append(rs.Timestamps[:0], ts.Timestamps...)
+		rs.MetricName.MoveFrom(&ts.MetricName)
+		rs.Values = ts.Values
+		ts.Values = nil
+		rs.Timestamps = ts.Timestamps
+		ts.Timestamps = nil
 	}
 	bbPool.Put(bb)
 
-	if maySort {
-		sort.Slice(result, func(i, j int) bool {
-			return metricNameLess(&result[i].MetricName, &result[j].MetricName)
-		})
-	}
-
 	return result, nil
+}
+
+func sortSeriesByMetricName(tss []*timeseries) {
+	sort.Slice(tss, func(i, j int) bool {
+		return metricNameLess(&tss[i].MetricName, &tss[j].MetricName)
+	})
 }
 
 func metricNameLess(a, b *storage.MetricName) bool {
@@ -273,10 +297,12 @@ func escapeDotsInRegexpLabelFilters(e metricsql.Expr) metricsql.Expr {
 		if !ok {
 			return
 		}
-		for i := range me.LabelFilters {
-			f := &me.LabelFilters[i]
-			if f.IsRegexp {
-				f.Value = escapeDots(f.Value)
+		for _, lfs := range me.LabelFilterss {
+			for i := range lfs {
+				f := &lfs[i]
+				if f.IsRegexp {
+					f.Value = escapeDots(f.Value)
+				}
 			}
 		}
 	})
@@ -326,22 +352,19 @@ type parseCacheValue struct {
 }
 
 type parseCache struct {
-	// Move atomic counters to the top of struct for 8-byte alignment on 32-bit arch.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
-
-	requests uint64
-	misses   uint64
+	requests atomic.Uint64
+	misses   atomic.Uint64
 
 	m  map[string]*parseCacheValue
 	mu sync.RWMutex
 }
 
 func (pc *parseCache) Requests() uint64 {
-	return atomic.LoadUint64(&pc.requests)
+	return pc.requests.Load()
 }
 
 func (pc *parseCache) Misses() uint64 {
-	return atomic.LoadUint64(&pc.misses)
+	return pc.misses.Load()
 }
 
 func (pc *parseCache) Len() uint64 {
@@ -352,14 +375,14 @@ func (pc *parseCache) Len() uint64 {
 }
 
 func (pc *parseCache) Get(q string) *parseCacheValue {
-	atomic.AddUint64(&pc.requests, 1)
+	pc.requests.Add(1)
 
 	pc.mu.RLock()
 	pcv := pc.m[q]
 	pc.mu.RUnlock()
 
 	if pcv == nil {
-		atomic.AddUint64(&pc.misses, 1)
+		pc.misses.Add(1)
 	}
 	return pcv
 }

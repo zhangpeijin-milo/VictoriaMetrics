@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"gopkg.in/yaml.v2"
 )
 
@@ -19,6 +20,7 @@ func TestIfExpressionParseFailure(t *testing.T) {
 	f(`{`)
 	f(`{foo`)
 	f(`foo{`)
+	f(`foo{bar="a" or}`)
 }
 
 func TestIfExpressionParseSuccess(t *testing.T) {
@@ -32,6 +34,12 @@ func TestIfExpressionParseSuccess(t *testing.T) {
 	f(`foo`)
 	f(`{foo="bar"}`)
 	f(`foo{bar=~"baz", x!="y"}`)
+	f(`{a="b" or c="d",e="x"}`)
+	f(`foo{
+  bar="a",x="y" or
+  x="a",a="b" or
+  a="x"
+}`)
 }
 
 func TestIfExpressionMarshalUnmarshalJSON(t *testing.T) {
@@ -62,6 +70,7 @@ func TestIfExpressionMarshalUnmarshalJSON(t *testing.T) {
 	}
 	f("foo", `"foo"`)
 	f(`{foo="bar",baz=~"x.*"}`, `"{foo=\"bar\",baz=~\"x.*\"}"`)
+	f(`{a="b" or c="d",x="z"}`, `"{a=\"b\" or c=\"d\",x=\"z\"}"`)
 }
 
 func TestIfExpressionUnmarshalFailure(t *testing.T) {
@@ -75,7 +84,7 @@ func TestIfExpressionUnmarshalFailure(t *testing.T) {
 	}
 	f(`{`)
 	f(`{x:y}`)
-	f(`[]`)
+	f(`[1]`)
 	f(`"{"`)
 	f(`'{'`)
 	f(`foo{bar`)
@@ -112,6 +121,9 @@ func TestIfExpressionUnmarshalSuccess(t *testing.T) {
 	f(`foo{bar="baz"}`)
 	f(`'{a="b", c!="d", e=~"g", h!~"d"}'`)
 	f(`foo{bar="zs",a=~"b|c"}`)
+	f(`foo{z="y" or bar="zs",a=~"b|c"}`)
+	f(`- foo
+- bar{baz="abc"}`)
 }
 
 func TestIfExpressionMatch(t *testing.T) {
@@ -121,14 +133,16 @@ func TestIfExpressionMatch(t *testing.T) {
 		if err := yaml.UnmarshalStrict([]byte(ifExpr), &ie); err != nil {
 			t.Fatalf("unexpected error during unmarshal: %s", err)
 		}
-		labels := MustParseMetricWithLabels(metricWithLabels)
-		if !ie.Match(labels) {
+		labels := promutils.MustNewLabelsFromString(metricWithLabels)
+		if !ie.Match(labels.GetLabels()) {
 			t.Fatalf("unexpected mismatch of ifExpr=%s for %s", ifExpr, metricWithLabels)
 		}
 	}
 	f(`foo`, `foo`)
 	f(`foo`, `foo{bar="baz",a="b"}`)
 	f(`foo{bar="a"}`, `foo{bar="a"}`)
+	f(`foo{bar="a" or baz="x"}`, `foo{bar="a"}`)
+	f(`foo{baz="x" or bar="a"}`, `foo{bar="a"}`)
 	f(`foo{bar="a"}`, `foo{x="y",bar="a",baz="b"}`)
 	f(`'{a=~"x|abc",y!="z"}'`, `m{x="aa",a="abc"}`)
 	f(`'{a=~"x|abc",y!="z"}'`, `m{x="aa",a="abc",y="qwe"}`)
@@ -155,14 +169,15 @@ func TestIfExpressionMismatch(t *testing.T) {
 		if err := yaml.UnmarshalStrict([]byte(ifExpr), &ie); err != nil {
 			t.Fatalf("unexpected error during unmarshal: %s", err)
 		}
-		labels := MustParseMetricWithLabels(metricWithLabels)
-		if ie.Match(labels) {
+		labels := promutils.MustNewLabelsFromString(metricWithLabels)
+		if ie.Match(labels.GetLabels()) {
 			t.Fatalf("unexpected match of ifExpr=%s for %s", ifExpr, metricWithLabels)
 		}
 	}
 	f(`foo`, `bar`)
 	f(`foo`, `a{foo="bar"}`)
 	f(`foo{bar="a"}`, `foo`)
+	f(`foo{bar="a" or baz="a"}`, `foo`)
 	f(`foo{bar="a"}`, `foo{bar="b"}`)
 	f(`foo{bar="a"}`, `foo{baz="b",a="b"}`)
 	f(`'{a=~"x|abc",y!="z"}'`, `m{x="aa",a="xabc"}`)
