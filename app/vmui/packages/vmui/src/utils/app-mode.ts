@@ -1,6 +1,6 @@
 export interface AppParams {
   serverURL?: string
-  inputTenantID?: boolean
+  useTenantID?: boolean
   headerStyles?: {
     background?: string
     color?: string
@@ -27,4 +27,4 @@ const getAppModeParams = (): AppParams => {
 
 const getAppModeEnable = (): boolean => !!Object.keys(getAppModeParams()).length;
 
-export {getAppModeEnable, getAppModeParams};
+export { getAppModeEnable, getAppModeParams };

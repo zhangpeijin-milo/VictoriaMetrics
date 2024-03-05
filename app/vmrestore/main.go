@@ -20,7 +20,7 @@ import (
 var (
 	httpListenAddr = flag.String("httpListenAddr", ":8421", "TCP address for exporting metrics at /metrics page")
 	src            = flag.String("src", "", "Source path with backup on the remote storage. "+
-		"Example: gs://bucket/path/to/backup, s3://bucket/path/to/backup, azblob://bucket/path/to/backup or fs:///path/to/local/backup")
+		"Example: gs://bucket/path/to/backup, s3://bucket/path/to/backup, azblob://container/path/to/backup or fs:///path/to/local/backup")
 	storageDataPath = flag.String("storageDataPath", "victoria-metrics-data", "Destination path where backup must be restored. "+
 		"VictoriaMetrics must be stopped when restoring from backup. -storageDataPath dir can be non-empty. In this case the contents of -storageDataPath dir "+
 		"is synchronized with -src contents, i.e. it works like 'rsync --delete'")
@@ -36,9 +36,9 @@ func main() {
 	envflag.Parse()
 	buildinfo.Init()
 	logger.Init()
-	pushmetrics.Init()
 
-	go httpserver.Serve(*httpListenAddr, nil)
+	listenAddrs := []string{*httpListenAddr}
+	go httpserver.Serve(listenAddrs, nil, nil)
 
 	srcFS, err := newSrcFS()
 	if err != nil {
@@ -54,15 +54,17 @@ func main() {
 		Dst:                     dstFS,
 		SkipBackupCompleteCheck: *skipBackupCompleteCheck,
 	}
+	pushmetrics.Init()
 	if err := a.Run(); err != nil {
 		logger.Fatalf("cannot restore from backup: %s", err)
 	}
+	pushmetrics.Stop()
 	srcFS.MustStop()
 	dstFS.MustStop()
 
 	startTime := time.Now()
-	logger.Infof("gracefully shutting down http server for metrics at %q", *httpListenAddr)
-	if err := httpserver.Stop(*httpListenAddr); err != nil {
+	logger.Infof("gracefully shutting down http server for metrics at %q", listenAddrs)
+	if err := httpserver.Stop(listenAddrs); err != nil {
 		logger.Fatalf("cannot stop http server for metrics: %s", err)
 	}
 	logger.Infof("successfully shut down http server for metrics in %.3f seconds", time.Since(startTime).Seconds())
@@ -83,7 +85,7 @@ func newDstFS() (*fslocal.FS, error) {
 	}
 	fs := &fslocal.FS{
 		Dir:               *storageDataPath,
-		MaxBytesPerSecond: maxBytesPerSecond.N,
+		MaxBytesPerSecond: maxBytesPerSecond.IntN(),
 	}
 	if err := fs.Init(); err != nil {
 		return nil, fmt.Errorf("cannot initialize local fs: %w", err)

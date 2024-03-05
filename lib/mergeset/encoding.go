@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
 	"unsafe"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
@@ -30,24 +28,20 @@ type Item struct {
 // The returned bytes representation belongs to data.
 func (it Item) Bytes(data []byte) []byte {
 	n := int(it.End - it.Start)
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&data))
-	sh.Cap = n
-	sh.Len = n
-	sh.Data += uintptr(it.Start)
-	return data
+	return unsafe.Slice((*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(unsafe.SliceData(data)))+uintptr(it.Start))), n)
 }
 
 // String returns string representation of it obtained from data.
 //
 // The returned string representation belongs to data.
 func (it Item) String(data []byte) string {
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&data))
-	sh.Data += uintptr(it.Start)
-	sh.Len = int(it.End - it.Start)
-	return *(*string)(unsafe.Pointer(sh))
+	n := int(it.End - it.Start)
+	return unsafe.String((*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(unsafe.SliceData(data)))+uintptr(it.Start))), n)
 }
 
-func (ib *inmemoryBlock) Len() int { return len(ib.items) }
+func (ib *inmemoryBlock) Len() int {
+	return len(ib.items)
+}
 
 func (ib *inmemoryBlock) Less(i, j int) bool {
 	items := ib.items
@@ -103,17 +97,18 @@ func (ib *inmemoryBlock) Reset() {
 }
 
 func (ib *inmemoryBlock) updateCommonPrefixSorted() {
-	ib.commonPrefix = ib.commonPrefix[:0]
 	items := ib.items
-	if len(items) == 0 {
+	if len(items) <= 1 {
+		// There is no sense in duplicating a single item or zero items into commonPrefix,
+		// since this only can increase blockHeader size without any benefits.
+		ib.commonPrefix = ib.commonPrefix[:0]
 		return
 	}
+
 	data := ib.data
 	cp := items[0].Bytes(data)
-	if len(items) > 1 {
-		cpLen := commonPrefixLen(cp, items[len(items)-1].Bytes(data))
-		cp = cp[:cpLen]
-	}
+	cpLen := commonPrefixLen(cp, items[len(items)-1].Bytes(data))
+	cp = cp[:cpLen]
 	ib.commonPrefix = append(ib.commonPrefix[:0], cp...)
 }
 
@@ -155,7 +150,7 @@ func commonPrefixLen(a, b []byte) int {
 
 // Add adds x to the end of ib.
 //
-// false is returned if x isn't added to ib due to block size contraints.
+// false is returned if x isn't added to ib due to block size constraints.
 func (ib *inmemoryBlock) Add(x []byte) bool {
 	data := ib.data
 	if len(x)+len(data) > maxInmemoryBlockSize {
@@ -334,8 +329,7 @@ func (ib *inmemoryBlock) marshalData(sb *storageBlock, firstItemDst, commonPrefi
 	return firstItemDst, commonPrefixDst, uint32(len(ib.items)), marshalTypeZSTD
 }
 
-// UnmarshalData decodes itemsCount items from sb and firstItem and stores
-// them to ib.
+// UnmarshalData decodes itemsCount items from sb and firstItem and stores them to ib.
 func (ib *inmemoryBlock) UnmarshalData(sb *storageBlock, firstItem, commonPrefix []byte, itemsCount uint32, mt marshalType) error {
 	ib.Reset()
 
@@ -570,26 +564,3 @@ func getLensBuffer(n int) *lensBuffer {
 func putLensBuffer(lb *lensBuffer) {
 	lensBufferPool.Put(lb)
 }
-
-func getInmemoryBlock() *inmemoryBlock {
-	select {
-	case ib := <-ibPoolCh:
-		return ib
-	default:
-		return &inmemoryBlock{}
-	}
-}
-
-func putInmemoryBlock(ib *inmemoryBlock) {
-	ib.Reset()
-	select {
-	case ibPoolCh <- ib:
-	default:
-		// drop ib in order to reduce memory usage on systems with big number of CPU cores
-	}
-}
-
-// Every inmemoryBlock struct occupies at least 64KB of memory, e.g. quite big amounts of memory.
-// Use a chan instead of sync.Pool in order to reduce memory usage on systems
-// with big number of CPU cores.
-var ibPoolCh = make(chan *inmemoryBlock, 100*cgroup.AvailableCPUs())

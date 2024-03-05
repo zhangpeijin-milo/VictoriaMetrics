@@ -6,7 +6,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/graphite"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/graphite/stream"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -19,9 +19,7 @@ var (
 //
 // See https://graphite.readthedocs.io/en/latest/feeding-carbon.html#the-plaintext-protocol
 func InsertHandler(r io.Reader) error {
-	return writeconcurrencylimiter.Do(func() error {
-		return parser.ParseStream(r, insertRows)
-	})
+	return stream.Parse(r, false, insertRows)
 }
 
 func insertRows(rows []parser.Row) error {

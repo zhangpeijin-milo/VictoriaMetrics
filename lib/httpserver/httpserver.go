@@ -1,9 +1,9 @@
 package httpserver
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
+	_ "embed"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,32 +26,40 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/metrics"
-	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/gzhttp"
 	"github.com/valyala/fastrand"
 )
 
 var (
-	tlsEnable       = flag.Bool("tls", false, "Whether to enable TLS for incoming HTTP requests at -httpListenAddr (aka https). -tlsCertFile and -tlsKeyFile must be set if -tls is set")
-	tlsCertFile     = flag.String("tlsCertFile", "", "Path to file with TLS certificate if -tls is set. Prefer ECDSA certs instead of RSA certs as RSA certs are slower. The provided certificate file is automatically re-read every second, so it can be dynamically updated")
-	tlsKeyFile      = flag.String("tlsKeyFile", "", "Path to file with TLS key if -tls is set. The provided key file is automatically re-read every second, so it can be dynamically updated")
+	tlsEnable = flagutil.NewArrayBool("tls", "Whether to enable TLS for incoming HTTP requests at the given -httpListenAddr (aka https). -tlsCertFile and -tlsKeyFile must be set if -tls is set. "+
+		"See also -mtls")
+	tlsCertFile = flagutil.NewArrayString("tlsCertFile", "Path to file with TLS certificate for the corresponding -httpListenAddr if -tls is set. "+
+		"Prefer ECDSA certs instead of RSA certs as RSA certs are slower. The provided certificate file is automatically re-read every second, so it can be dynamically updated")
+	tlsKeyFile = flagutil.NewArrayString("tlsKeyFile", "Path to file with TLS key for the corresponding -httpListenAddr if -tls is set. "+
+		"The provided key file is automatically re-read every second, so it can be dynamically updated")
 	tlsCipherSuites = flagutil.NewArrayString("tlsCipherSuites", "Optional list of TLS cipher suites for incoming requests over HTTPS if -tls is set. See the list of supported cipher suites at https://pkg.go.dev/crypto/tls#pkg-constants")
-	tlsMinVersion   = flag.String("tlsMinVersion", "", "Optional minimum TLS version to use for incoming requests over HTTPS if -tls is set. "+
+	tlsMinVersion   = flagutil.NewArrayString("tlsMinVersion", "Optional minimum TLS version to use for the corresponding -httpListenAddr if -tls is set. "+
 		"Supported values: TLS10, TLS11, TLS12, TLS13")
 
 	pathPrefix = flag.String("http.pathPrefix", "", "An optional prefix to add to all the paths handled by http server. For example, if '-http.pathPrefix=/foo/bar' is set, "+
 		"then all the http requests will be handled on '/foo/bar/*' paths. This may be useful for proxied requests. "+
 		"See https://www.robustperception.io/using-external-urls-and-proxies-with-prometheus")
-	httpAuthUsername = flag.String("httpAuth.username", "", "Username for HTTP Basic Auth. The authentication is disabled if empty. See also -httpAuth.password")
-	httpAuthPassword = flag.String("httpAuth.password", "", "Password for HTTP Basic Auth. The authentication is disabled if -httpAuth.username is empty")
-	metricsAuthKey   = flag.String("metricsAuthKey", "", "Auth key for /metrics endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
-	flagsAuthKey     = flag.String("flagsAuthKey", "", "Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
-	pprofAuthKey     = flag.String("pprofAuthKey", "", "Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	httpAuthUsername = flag.String("httpAuth.username", "", "Username for HTTP server's Basic Auth. The authentication is disabled if empty. See also -httpAuth.password")
+	httpAuthPassword = flagutil.NewPassword("httpAuth.password", "Password for HTTP server's Basic Auth. The authentication is disabled if -httpAuth.username is empty")
+	metricsAuthKey   = flagutil.NewPassword("metricsAuthKey", "Auth key for /metrics endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	flagsAuthKey     = flagutil.NewPassword("flagsAuthKey", "Auth key for /flags endpoint. It must be passed via authKey query arg. It overrides httpAuth.* settings")
+	pprofAuthKey     = flagutil.NewPassword("pprofAuthKey", "Auth key for /debug/pprof/* endpoints. It must be passed via authKey query arg. It overrides httpAuth.* settings")
 
-	disableResponseCompression  = flag.Bool("http.disableResponseCompression", false, "Disable compression of HTTP responses to save CPU resources. By default compression is enabled to save network bandwidth")
+	disableResponseCompression  = flag.Bool("http.disableResponseCompression", false, "Disable compression of HTTP responses to save CPU resources. By default, compression is enabled to save network bandwidth")
 	maxGracefulShutdownDuration = flag.Duration("http.maxGracefulShutdownDuration", 7*time.Second, `The maximum duration for a graceful shutdown of the HTTP server. A highly loaded server may require increased value for a graceful shutdown`)
 	shutdownDelay               = flag.Duration("http.shutdownDelay", 0, `Optional delay before http server shutdown. During this delay, the server returns non-OK responses from /health page, so load balancers can route new requests to other servers`)
 	idleConnTimeout             = flag.Duration("http.idleConnTimeout", time.Minute, "Timeout for incoming idle http connections")
-	connTimeout                 = flag.Duration("http.connTimeout", 2*time.Minute, `Incoming http connections are closed after the configured timeout. This may help to spread the incoming load among a cluster of services behind a load balancer. Please note that the real timeout may be bigger by up to 10% as a protection against the thundering herd problem`)
+	connTimeout                 = flag.Duration("http.connTimeout", 2*time.Minute, "Incoming connections to -httpListenAddr are closed after the configured timeout. "+
+		"This may help evenly spreading load among a cluster of services behind TCP-level load balancer. Zero value disables closing of incoming connections")
+
+	headerHSTS         = flag.String("http.header.hsts", "", "Value for 'Strict-Transport-Security' header, recommended: 'max-age=31536000; includeSubDomains'")
+	headerFrameOptions = flag.String("http.header.frameOptions", "", "Value for 'X-Frame-Options' header")
+	headerCSP          = flag.String("http.header.csp", "", `Value for 'Content-Security-Policy' header, recommended: "default-src 'self'"`)
 )
 
 var (
@@ -60,7 +68,7 @@ var (
 )
 
 type server struct {
-	shutdownDelayDeadline int64
+	shutdownDelayDeadline atomic.Int64
 	s                     *http.Server
 }
 
@@ -72,38 +80,55 @@ type server struct {
 // In such cases the caller must serve the request.
 type RequestHandler func(w http.ResponseWriter, r *http.Request) bool
 
-// Serve starts an http server on the given addr with the given optional rh.
+// Serve starts an http server on the given addrs with the given optional rh.
 //
-// By default all the responses are transparently compressed, since Google
-// charges a lot for the egress traffic. The compression may be disabled
-// by calling DisableResponseCompression before writing the first byte to w.
+// By default all the responses are transparently compressed, since egress traffic is usually expensive.
 //
-// The compression is also disabled if -http.disableResponseCompression flag is set.
-func Serve(addr string, rh RequestHandler) {
+// The compression can be disabled by specifying -http.disableResponseCompression command-line flag.
+//
+// If useProxyProtocol is set to true for the corresponding addr, then the incoming connections are accepted via proxy protocol.
+// See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
+func Serve(addrs []string, useProxyProtocol *flagutil.ArrayBool, rh RequestHandler) {
 	if rh == nil {
 		rh = func(w http.ResponseWriter, r *http.Request) bool {
 			return false
 		}
 	}
+	for idx, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		useProxyProto := false
+		if useProxyProtocol != nil {
+			useProxyProto = useProxyProtocol.GetOptionalArg(idx)
+		}
+		go serve(addr, useProxyProto, rh, idx)
+	}
+}
+
+func serve(addr string, useProxyProtocol bool, rh RequestHandler, idx int) {
 	scheme := "http"
-	if *tlsEnable {
+	if tlsEnable.GetOptionalArg(idx) {
 		scheme = "https"
 	}
 	hostAddr := addr
 	if strings.HasPrefix(hostAddr, ":") {
 		hostAddr = "127.0.0.1" + hostAddr
 	}
-	logger.Infof("starting http server at %s://%s/", scheme, hostAddr)
+	logger.Infof("starting server at %s://%s/", scheme, hostAddr)
 	logger.Infof("pprof handlers are exposed at %s://%s/debug/pprof/", scheme, hostAddr)
 	var tlsConfig *tls.Config
-	if *tlsEnable {
-		tc, err := netutil.GetServerTLSConfig(*tlsCertFile, *tlsKeyFile, *tlsMinVersion, *tlsCipherSuites)
+	if tlsEnable.GetOptionalArg(idx) {
+		certFile := tlsCertFile.GetOptionalArg(idx)
+		keyFile := tlsKeyFile.GetOptionalArg(idx)
+		minVersion := tlsMinVersion.GetOptionalArg(idx)
+		tc, err := netutil.GetServerTLSConfig(certFile, keyFile, minVersion, *tlsCipherSuites)
 		if err != nil {
-			logger.Fatalf("cannot load TLS cert from -tlsCertFile=%q, -tlsKeyFile=%q, -tlsMinVersion=%q: %s", *tlsCertFile, *tlsKeyFile, *tlsMinVersion, err)
+			logger.Fatalf("cannot load TLS cert from -tlsCertFile=%q, -tlsKeyFile=%q, -tlsMinVersion=%q, -tlsCipherSuites=%q: %s", certFile, keyFile, minVersion, *tlsCipherSuites, err)
 		}
 		tlsConfig = tc
 	}
-	ln, err := netutil.NewTCPListener(scheme, addr, tlsConfig)
+	ln, err := netutil.NewTCPListener(scheme, addr, useProxyProtocol, tlsConfig)
 	if err != nil {
 		logger.Fatalf("cannot start http server at %s: %s", addr, err)
 	}
@@ -125,8 +150,9 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler) {
 		// since these timeouts must be controlled by request handlers.
 
 		ErrorLog: logger.StdErrorLogger(),
-
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+	}
+	if *connTimeout > 0 {
+		s.s.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
 			timeoutSec := connTimeout.Seconds()
 			// Add a jitter for connection timeout in order to prevent Thundering herd problem
 			// when all the connections are established at the same time.
@@ -134,8 +160,9 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler) {
 			jitterSec := fastrand.Uint32n(uint32(timeoutSec / 10))
 			deadline := fasttime.UnixTimestamp() + uint64(timeoutSec) + uint64(jitterSec)
 			return context.WithValue(ctx, connDeadlineTimeKey, &deadline)
-		},
+		}
 	}
+
 	serversLock.Lock()
 	servers[addr] = &s
 	serversLock.Unlock()
@@ -149,6 +176,9 @@ func serveWithListener(addr string, ln net.Listener, rh RequestHandler) {
 }
 
 func whetherToCloseConn(r *http.Request) bool {
+	if *connTimeout <= 0 {
+		return false
+	}
 	ctx := r.Context()
 	v := ctx.Value(connDeadlineTimeKey)
 	deadline, ok := v.(*uint64)
@@ -157,22 +187,45 @@ func whetherToCloseConn(r *http.Request) bool {
 
 var connDeadlineTimeKey = interface{}("connDeadlineSecs")
 
-// Stop stops the http server on the given addr, which has been started
-// via Serve func.
-func Stop(addr string) error {
+// Stop stops the http server on the given addrs, which has been started via Serve func.
+func Stop(addrs []string) error {
+	var errGlobalLock sync.Mutex
+	var errGlobal error
+
+	var wg sync.WaitGroup
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(addr string) {
+			if err := stop(addr); err != nil {
+				errGlobalLock.Lock()
+				errGlobal = err
+				errGlobalLock.Unlock()
+			}
+			wg.Done()
+		}(addr)
+	}
+	wg.Wait()
+
+	return errGlobal
+}
+
+func stop(addr string) error {
 	serversLock.Lock()
 	s := servers[addr]
 	delete(servers, addr)
 	serversLock.Unlock()
 	if s == nil {
-		err := fmt.Errorf("BUG: there is no http server at %q", addr)
+		err := fmt.Errorf("BUG: there is no server at %q", addr)
 		logger.Panicf("%s", err)
 		// The return is needed for golangci-lint: SA5011(related information): this check suggests that the pointer can be nil
 		return err
 	}
 
 	deadline := time.Now().Add(*shutdownDelay).UnixNano()
-	atomic.StoreInt64(&s.shutdownDelayDeadline, deadline)
+	s.shutdownDelayDeadline.Store(deadline)
 	if *shutdownDelay > 0 {
 		// Sleep for a while until load balancer in front of the server
 		// notifies that "/health" endpoint returns non-OK responses.
@@ -192,19 +245,27 @@ func Stop(addr string) error {
 }
 
 func gzipHandler(s *server, rh RequestHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w = maybeGzipResponseWriter(w, r)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handlerWrapper(s, w, r, rh)
-		if zrw, ok := w.(*gzipResponseWriter); ok {
-			if err := zrw.Close(); err != nil && !isTrivialNetworkError(err) {
-				logger.Warnf("gzipResponseWriter.Close: %s", err)
-			}
-		}
+	})
+	if *disableResponseCompression {
+		return h
 	}
+	return gzipHandlerWrapper(h)
 }
 
-var metricsHandlerDuration = metrics.NewHistogram(`vm_http_request_duration_seconds{path="/metrics"}`)
-var connTimeoutClosedConns = metrics.NewCounter(`vm_http_conn_timeout_closed_conns_total`)
+var gzipHandlerWrapper = func() func(http.Handler) http.HandlerFunc {
+	hw, err := gzhttp.NewWrapper(gzhttp.CompressionLevel(1))
+	if err != nil {
+		panic(fmt.Errorf("BUG: cannot initialize gzip http wrapper: %w", err))
+	}
+	return hw
+}()
+
+var (
+	metricsHandlerDuration = metrics.NewHistogram(`vm_http_request_duration_seconds{path="/metrics"}`)
+	connTimeoutClosedConns = metrics.NewCounter(`vm_http_conn_timeout_closed_conns_total`)
+)
 
 var hostname = func() string {
 	h, err := os.Hostname()
@@ -232,13 +293,29 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 		}
 	}()
 
-	w.Header().Add("X-Server-Hostname", hostname)
+	h := w.Header()
+	if *headerHSTS != "" {
+		h.Add("Strict-Transport-Security", *headerHSTS)
+	}
+	if *headerFrameOptions != "" {
+		h.Add("X-Frame-Options", *headerFrameOptions)
+	}
+	if *headerCSP != "" {
+		h.Add("Content-Security-Policy", *headerCSP)
+	}
+	h.Add("X-Server-Hostname", hostname)
 	requestsTotal.Inc()
 	if whetherToCloseConn(r) {
 		connTimeoutClosedConns.Inc()
-		w.Header().Set("Connection", "close")
+		h.Set("Connection", "close")
 	}
 	path := r.URL.Path
+	if strings.HasSuffix(path, "/favicon.ico") {
+		w.Header().Set("Cache-Control", "max-age=3600")
+		faviconRequests.Inc()
+		w.Write(faviconData)
+		return
+	}
 	prefix := GetPathPrefix()
 	if prefix != "" {
 		// Trim -http.pathPrefix from path
@@ -261,8 +338,8 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 	}
 	switch r.URL.Path {
 	case "/health":
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		deadline := atomic.LoadInt64(&s.shutdownDelayDeadline)
+		h.Set("Content-Type", "text/plain; charset=utf-8")
+		deadline := s.shutdownDelayDeadline.Load()
 		if deadline <= 0 {
 			w.Write([]byte("OK"))
 			return
@@ -286,27 +363,21 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 		}
 		w.WriteHeader(status)
 		return
-	case "/favicon.ico":
-		faviconRequests.Inc()
-		w.WriteHeader(http.StatusNoContent)
-		return
 	case "/metrics":
 		metricsRequests.Inc()
-		if len(*metricsAuthKey) > 0 && r.FormValue("authKey") != *metricsAuthKey {
-			http.Error(w, "The provided authKey doesn't match -metricsAuthKey", http.StatusUnauthorized)
+		if !CheckAuthFlag(w, r, metricsAuthKey.Get(), "metricsAuthKey") {
 			return
 		}
 		startTime := time.Now()
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		h.Set("Content-Type", "text/plain; charset=utf-8")
 		appmetrics.WritePrometheusMetrics(w)
 		metricsHandlerDuration.UpdateDuration(startTime)
 		return
 	case "/flags":
-		if len(*flagsAuthKey) > 0 && r.FormValue("authKey") != *flagsAuthKey {
-			http.Error(w, "The provided authKey doesn't match -flagsAuthKey", http.StatusUnauthorized)
+		if !CheckAuthFlag(w, r, flagsAuthKey.Get(), "flagsAuthKey") {
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		h.Set("Content-Type", "text/plain; charset=utf-8")
 		flagutil.WriteFlags(w)
 		return
 	case "/-/healthy":
@@ -319,20 +390,27 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1833
 		fmt.Fprintf(w, "VictoriaMetrics is Ready.\n")
 		return
+	case "/robots.txt":
+		// This prevents search engines from indexing contents
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4128
+		fmt.Fprintf(w, "User-agent: *\nDisallow: /\n")
+		return
 	default:
 		if strings.HasPrefix(r.URL.Path, "/debug/pprof/") {
 			pprofRequests.Inc()
-			if len(*pprofAuthKey) > 0 && r.FormValue("authKey") != *pprofAuthKey {
-				http.Error(w, "The provided authKey doesn't match -pprofAuthKey", http.StatusUnauthorized)
+			if !CheckAuthFlag(w, r, pprofAuthKey.Get(), "pprofAuthKey") {
 				return
 			}
-			DisableResponseCompression(w)
 			pprofHandler(r.URL.Path[len("/debug/pprof/"):], w, r)
 			return
 		}
 
-		if !checkBasicAuth(w, r) {
+		if !CheckBasicAuth(w, r) {
 			return
+		}
+
+		w = &responseWriterWithAbort{
+			ResponseWriter: w,
 		}
 		if rh(w, r) {
 			return
@@ -344,60 +422,39 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 	}
 }
 
-func checkBasicAuth(w http.ResponseWriter, r *http.Request) bool {
+// CheckAuthFlag checks whether the given authKey is set and valid
+//
+// Falls back to checkBasicAuth if authKey is not set
+func CheckAuthFlag(w http.ResponseWriter, r *http.Request, flagValue string, flagName string) bool {
+	if flagValue == "" {
+		return CheckBasicAuth(w, r)
+	}
+	if r.FormValue("authKey") != flagValue {
+		authKeyRequestErrors.Inc()
+		http.Error(w, fmt.Sprintf("The provided authKey doesn't match -%s", flagName), http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+// CheckBasicAuth validates credentials provided in request if httpAuth.* flags are set
+// returns true if credentials are valid or httpAuth.* flags are not set
+func CheckBasicAuth(w http.ResponseWriter, r *http.Request) bool {
 	if len(*httpAuthUsername) == 0 {
 		// HTTP Basic Auth is disabled.
 		return true
 	}
 	username, password, ok := r.BasicAuth()
-	if ok && username == *httpAuthUsername && password == *httpAuthPassword {
-		return true
+	if ok {
+		if username == *httpAuthUsername && password == httpAuthPassword.Get() {
+			return true
+		}
+		authBasicRequestErrors.Inc()
 	}
+
 	w.Header().Set("WWW-Authenticate", `Basic realm="VictoriaMetrics"`)
 	http.Error(w, "", http.StatusUnauthorized)
 	return false
-}
-
-func maybeGzipResponseWriter(w http.ResponseWriter, r *http.Request) http.ResponseWriter {
-	if *disableResponseCompression {
-		return w
-	}
-	if r.Header.Get("Connection") == "Upgrade" {
-		return w
-	}
-	ae := r.Header.Get("Accept-Encoding")
-	if ae == "" {
-		return w
-	}
-	ae = strings.ToLower(ae)
-	n := strings.Index(ae, "gzip")
-	if n < 0 {
-		// Do not apply gzip encoding to the response.
-		return w
-	}
-	// Apply gzip encoding to the response.
-	zw := getGzipWriter(w)
-	bw := getBufioWriter(zw)
-	zrw := &gzipResponseWriter{
-		rw: w,
-		zw: zw,
-		bw: bw,
-	}
-	return zrw
-}
-
-// DisableResponseCompression disables response compression on w.
-//
-// The function must be called before the first w.Write* call.
-func DisableResponseCompression(w http.ResponseWriter) {
-	zrw, ok := w.(*gzipResponseWriter)
-	if !ok {
-		return
-	}
-	if zrw.firstWriteDone {
-		logger.Panicf("BUG: DisableResponseCompression must be called before sending the response")
-	}
-	zrw.disableCompression = true
 }
 
 // EnableCORS enables https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS
@@ -405,131 +462,6 @@ func DisableResponseCompression(w http.ResponseWriter) {
 func EnableCORS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 }
-
-func getGzipWriter(w io.Writer) *gzip.Writer {
-	v := gzipWriterPool.Get()
-	if v == nil {
-		zw, err := gzip.NewWriterLevel(w, 1)
-		if err != nil {
-			logger.Panicf("BUG: cannot create gzip writer: %s", err)
-		}
-		return zw
-	}
-	zw := v.(*gzip.Writer)
-	zw.Reset(w)
-	return zw
-}
-
-func putGzipWriter(zw *gzip.Writer) {
-	gzipWriterPool.Put(zw)
-}
-
-var gzipWriterPool sync.Pool
-
-type gzipResponseWriter struct {
-	rw         http.ResponseWriter
-	zw         *gzip.Writer
-	bw         *bufio.Writer
-	statusCode int
-
-	firstWriteDone     bool
-	disableCompression bool
-}
-
-// Implements http.ResponseWriter.Header method.
-func (zrw *gzipResponseWriter) Header() http.Header {
-	return zrw.rw.Header()
-}
-
-// Implements http.ResponseWriter.Write method.
-func (zrw *gzipResponseWriter) Write(p []byte) (int, error) {
-	if !zrw.firstWriteDone {
-		h := zrw.Header()
-		if zrw.statusCode == http.StatusNoContent {
-			zrw.disableCompression = true
-		}
-		if h.Get("Content-Encoding") != "" {
-			zrw.disableCompression = true
-		}
-		if !zrw.disableCompression {
-			h.Set("Content-Encoding", "gzip")
-			h.Del("Content-Length")
-			if h.Get("Content-Type") == "" {
-				// Disable auto-detection of content-type, since it
-				// is incorrectly detected after the compression.
-				h.Set("Content-Type", "text/html; charset=utf-8")
-			}
-		}
-		zrw.writeHeader()
-		zrw.firstWriteDone = true
-	}
-	if zrw.disableCompression {
-		return zrw.rw.Write(p)
-	}
-	return zrw.bw.Write(p)
-}
-
-// Implements http.ResponseWriter.WriteHeader method.
-func (zrw *gzipResponseWriter) WriteHeader(statusCode int) {
-	zrw.statusCode = statusCode
-}
-
-func (zrw *gzipResponseWriter) writeHeader() {
-	if zrw.statusCode == 0 {
-		zrw.statusCode = http.StatusOK
-	}
-	zrw.rw.WriteHeader(zrw.statusCode)
-}
-
-// Implements http.Flusher
-func (zrw *gzipResponseWriter) Flush() {
-	if !zrw.firstWriteDone {
-		_, _ = zrw.Write(nil)
-	}
-	if !zrw.disableCompression {
-		if err := zrw.bw.Flush(); err != nil && !isTrivialNetworkError(err) {
-			logger.Warnf("gzipResponseWriter.Flush (buffer): %s", err)
-		}
-		if err := zrw.zw.Flush(); err != nil && !isTrivialNetworkError(err) {
-			logger.Warnf("gzipResponseWriter.Flush (gzip): %s", err)
-		}
-	}
-	if fw, ok := zrw.rw.(http.Flusher); ok {
-		fw.Flush()
-	}
-}
-
-func (zrw *gzipResponseWriter) Close() error {
-	if !zrw.firstWriteDone {
-		_, _ = zrw.Write(nil)
-	}
-	zrw.Flush()
-	var err error
-	if !zrw.disableCompression {
-		err = zrw.zw.Close()
-	}
-	putGzipWriter(zrw.zw)
-	zrw.zw = nil
-	putBufioWriter(zrw.bw)
-	zrw.bw = nil
-	return err
-}
-
-func getBufioWriter(w io.Writer) *bufio.Writer {
-	v := bufioWriterPool.Get()
-	if v == nil {
-		return bufio.NewWriterSize(w, 16*1024)
-	}
-	bw := v.(*bufio.Writer)
-	bw.Reset(w)
-	return bw
-}
-
-func putBufioWriter(bw *bufio.Writer) {
-	bufioWriterPool.Put(bw)
-}
-
-var bufioWriterPool sync.Pool
 
 func pprofHandler(profileName string, w http.ResponseWriter, r *http.Request) {
 	// This switch has been stolen from init func at https://golang.org/src/net/http/pprof/pprof.go
@@ -571,20 +503,89 @@ var (
 	pprofTraceRequests   = metrics.NewCounter(`vm_http_requests_total{path="/debug/pprof/trace"}`)
 	pprofMutexRequests   = metrics.NewCounter(`vm_http_requests_total{path="/debug/pprof/mutex"}`)
 	pprofDefaultRequests = metrics.NewCounter(`vm_http_requests_total{path="/debug/pprof/default"}`)
-	faviconRequests      = metrics.NewCounter(`vm_http_requests_total{path="/favicon.ico"}`)
+	faviconRequests      = metrics.NewCounter(`vm_http_requests_total{path="*/favicon.ico"}`)
 
+	authBasicRequestErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="*", reason="wrong_basic_auth"}`)
+	authKeyRequestErrors     = metrics.NewCounter(`vm_http_request_errors_total{path="*", reason="wrong_auth_key"}`)
 	unsupportedRequestErrors = metrics.NewCounter(`vm_http_request_errors_total{path="*", reason="unsupported"}`)
 
 	requestsTotal = metrics.NewCounter(`vm_http_requests_all_total`)
 )
 
+//go:embed favicon.ico
+var faviconData []byte
+
 // GetQuotedRemoteAddr returns quoted remote address.
 func GetQuotedRemoteAddr(r *http.Request) string {
-	remoteAddr := strconv.Quote(r.RemoteAddr) // quote remoteAddr and X-Forwarded-For, since they may contain untrusted input
+	remoteAddr := r.RemoteAddr
 	if addr := r.Header.Get("X-Forwarded-For"); addr != "" {
-		remoteAddr += ", X-Forwarded-For: " + strconv.Quote(addr)
+		remoteAddr += ", X-Forwarded-For: " + addr
 	}
-	return remoteAddr
+	// quote remoteAddr and X-Forwarded-For, since they may contain untrusted input
+	return strconv.Quote(remoteAddr)
+}
+
+type responseWriterWithAbort struct {
+	http.ResponseWriter
+
+	sentHeaders bool
+	aborted     bool
+}
+
+func (rwa *responseWriterWithAbort) Write(data []byte) (int, error) {
+	if rwa.aborted {
+		return 0, fmt.Errorf("response connection is aborted")
+	}
+	if !rwa.sentHeaders {
+		rwa.sentHeaders = true
+	}
+	return rwa.ResponseWriter.Write(data)
+}
+
+func (rwa *responseWriterWithAbort) WriteHeader(statusCode int) {
+	if rwa.aborted {
+		logger.WarnfSkipframes(1, "cannot write response headers with statusCode=%d, since the response connection has been aborted", statusCode)
+		return
+	}
+	if rwa.sentHeaders {
+		logger.WarnfSkipframes(1, "cannot write response headers with statusCode=%d, since they were already sent", statusCode)
+		return
+	}
+	rwa.ResponseWriter.WriteHeader(statusCode)
+	rwa.sentHeaders = true
+}
+
+// abort aborts the client connection associated with rwa.
+//
+// The last http chunk in the response stream is intentionally written incorrectly,
+// so the client, which reads the response, could notice this error.
+func (rwa *responseWriterWithAbort) abort() {
+	if !rwa.sentHeaders {
+		logger.Panicf("BUG: abort can be called only after http response headers are sent")
+	}
+	if rwa.aborted {
+		logger.WarnfSkipframes(2, "cannot abort the connection, since it has been already aborted")
+		return
+	}
+	hj, ok := rwa.ResponseWriter.(http.Hijacker)
+	if !ok {
+		logger.Panicf("BUG: ResponseWriter must implement http.Hijacker interface")
+	}
+	conn, bw, err := hj.Hijack()
+	if err != nil {
+		logger.WarnfSkipframes(2, "cannot hijack response connection: %s", err)
+		return
+	}
+
+	// Just write an error message into the client connection as is without http chunked encoding.
+	// This is needed in order to notify the client about the aborted connection.
+	_, _ = bw.WriteString("\nthe connection has been aborted; see the last line in the response and/or in the server log for the reason\n")
+	_ = bw.Flush()
+
+	// Forcibly close the client connection in order to break http keep-alive at client side.
+	_ = conn.Close()
+
+	rwa.aborted = true
 }
 
 // Errorf writes formatted error message to w and to logger.
@@ -603,6 +604,13 @@ func Errorf(w http.ResponseWriter, r *http.Request, format string, args ...inter
 			statusCode = esc.StatusCode
 			break
 		}
+	}
+	if rwa, ok := w.(*responseWriterWithAbort); ok && rwa.sentHeaders {
+		// HTTP status code has been already sent to client, so it cannot be sent again.
+		// Just write errStr to the response and abort the client connection, so the client could notice the error.
+		fmt.Fprintf(w, "\n%s\n", errStr)
+		rwa.abort()
+		return
 	}
 	http.Error(w, errStr, statusCode)
 }
@@ -627,17 +635,9 @@ func (e *ErrorWithStatusCode) Error() string {
 	return e.Err.Error()
 }
 
-func isTrivialNetworkError(err error) bool {
-	s := err.Error()
-	if strings.Contains(s, "broken pipe") || strings.Contains(s, "reset by peer") {
-		return true
-	}
-	return false
-}
-
-// IsTLS indicates is tls enabled or not
-func IsTLS() bool {
-	return *tlsEnable
+// IsTLS indicates is tls enabled or not for -httpListenAddr at the given idx.
+func IsTLS(idx int) bool {
+	return tlsEnable.GetOptionalArg(idx)
 }
 
 // GetPathPrefix - returns http server path prefix.
@@ -666,7 +666,7 @@ func WriteAPIHelp(w io.Writer, pathList [][2]string) {
 // GetRequestURI returns requestURI for r.
 func GetRequestURI(r *http.Request) string {
 	requestURI := r.RequestURI
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		return requestURI
 	}
 	_ = r.ParseForm()
@@ -691,4 +691,11 @@ func Redirect(w http.ResponseWriter, url string) {
 	// since browsers can cache incorrect redirects returned with StatusMovedPermanently.
 	// This may require browser cache cleaning after the incorrect redirect is fixed.
 	w.WriteHeader(http.StatusFound)
+}
+
+// LogError logs the errStr with the context from req.
+func LogError(req *http.Request, errStr string) {
+	uri := GetRequestURI(req)
+	remoteAddr := GetQuotedRemoteAddr(req)
+	logger.Errorf("uri: %s, remote address: %q: %s", uri, remoteAddr, errStr)
 }

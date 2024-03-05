@@ -72,10 +72,7 @@ func TestSearchQueryMarshalUnmarshal(t *testing.T) {
 
 func TestSearch(t *testing.T) {
 	path := "TestSearch"
-	st, err := OpenStorage(path, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("cannot open storage %q: %s", path, err)
-	}
+	st := MustOpenStorage(path, 0, 0, 0)
 	defer func() {
 		st.MustClose()
 		if err := os.RemoveAll(path); err != nil {
@@ -87,7 +84,6 @@ func TestSearch(t *testing.T) {
 	const rowsCount = 2e4
 	const rowsPerBlock = 1e3
 	const metricGroupsCount = rowsCount / 5
-	const accountsCount = 2
 
 	mrs := make([]MetricRow, rowsCount)
 	var mn MetricName
@@ -121,10 +117,7 @@ func TestSearch(t *testing.T) {
 
 	// Re-open the storage in order to flush all the pending cached data.
 	st.MustClose()
-	st, err = OpenStorage(path, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("cannot re-open storage %q: %s", path, err)
-	}
+	st = MustOpenStorage(path, 0, 0, 0)
 
 	// Run search.
 	tr := TimeRange{
@@ -133,7 +126,7 @@ func TestSearch(t *testing.T) {
 	}
 
 	t.Run("serial", func(t *testing.T) {
-		if err := testSearchInternal(st, tr, mrs, accountsCount); err != nil {
+		if err := testSearchInternal(st, tr, mrs); err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -142,7 +135,7 @@ func TestSearch(t *testing.T) {
 		ch := make(chan error, 3)
 		for i := 0; i < cap(ch); i++ {
 			go func() {
-				ch <- testSearchInternal(st, tr, mrs, accountsCount)
+				ch <- testSearchInternal(st, tr, mrs)
 			}()
 		}
 		var firstError error
@@ -162,7 +155,7 @@ func TestSearch(t *testing.T) {
 	})
 }
 
-func testSearchInternal(st *Storage, tr TimeRange, mrs []MetricRow, accountsCount int) error {
+func testSearchInternal(st *Storage, tr TimeRange, mrs []MetricRow) error {
 	var s Search
 	for i := 0; i < 10; i++ {
 		// Prepare TagFilters for search.

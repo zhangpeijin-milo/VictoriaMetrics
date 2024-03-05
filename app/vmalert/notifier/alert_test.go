@@ -54,14 +54,15 @@ func TestAlert_ExecTemplate(t *testing.T) {
 					"job":      "staging",
 					"instance": "localhost",
 				},
+				For: 5 * time.Minute,
 			},
 			annotations: map[string]string{
 				"summary":     "Too high connection number for {{$labels.instance}} for job {{$labels.job}}",
-				"description": "It is {{ $value }} connections for {{$labels.instance}}",
+				"description": "It is {{ $value }} connections for {{$labels.instance}} for more than {{ .For }}",
 			},
 			expTpl: map[string]string{
 				"summary":     "Too high connection number for localhost for job staging",
-				"description": "It is 10000 connections for localhost",
+				"description": "It is 10000 connections for localhost for more than 5m0s",
 			},
 		},
 		{
@@ -152,7 +153,7 @@ func TestAlert_ExecTemplate(t *testing.T) {
 			},
 		},
 		{
-			name: "ActiveAt custome format",
+			name: "ActiveAt custom format",
 			alert: &Alert{
 				ActiveAt: time.Date(2022, 8, 19, 20, 34, 58, 651387237, time.UTC),
 			},
@@ -199,6 +200,9 @@ func TestAlert_ExecTemplate(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateTemplates(tc.annotations); err != nil {
+				t.Fatal(err)
+			}
 			tpl, err := tc.alert.ExecTemplate(qFn, tc.alert.Labels, tc.annotations)
 			if err != nil {
 				t.Fatal(err)
@@ -233,13 +237,18 @@ func TestAlert_toPromLabels(t *testing.T) {
 		[]prompbmarshal.Label{{Name: "a", Value: "baz"}, {Name: "foo", Value: "bar"}},
 		nil,
 	)
+	fn(
+		map[string]string{"foo.bar": "baz", "service!name": "qux"},
+		[]prompbmarshal.Label{{Name: "foo_bar", Value: "baz"}, {Name: "service_name", Value: "qux"}},
+		nil,
+	)
 
 	pcs, err := promrelabel.ParseRelabelConfigsData([]byte(`
 - target_label: "foo"
   replacement: "aaa"
 - action: labeldrop
   regex: "env.*"
-`), false)
+`))
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}

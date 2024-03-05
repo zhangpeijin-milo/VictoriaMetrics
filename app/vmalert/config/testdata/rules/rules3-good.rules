@@ -7,6 +7,7 @@ groups:
       - alert: Conns
         expr: filterSeries(sumSeries(host.receiver.interface.cons),'last','>', 500)
         for: 3m
+
         annotations:
           summary: Too high connection number for {{$labels.instance}}
           description: "It is {{ $value }} connections for {{$labels.instance}}"
@@ -14,6 +15,7 @@ groups:
     interval: 2s
     concurrency: 2
     type: prometheus
+    eval_delay: 30s
     rules:
       - alert: Conns
         expr: sum(vm_tcplistener_conns) by (instance) > 1

@@ -10,7 +10,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storagepacelimiter"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/stringsutil"
 )
 
 // BlockRef references a Block.
@@ -101,7 +101,7 @@ type Search struct {
 
 	ts tableSearch
 
-	// tr contains time range used in the serach.
+	// tr contains time range used in the search.
 	tr TimeRange
 
 	// tfss contains tag filters used in the search.
@@ -166,7 +166,7 @@ func (s *Search) Init(qt *querytracer.Tracer, storage *Storage, tfss []*TagFilte
 	}
 	// It is ok to call Init on non-nil err.
 	// Init must be called before returning because it will fail
-	// on Seach.MustClose otherwise.
+	// on Search.MustClose otherwise.
 	s.ts.Init(storage.tb, tsids, tr)
 	qt.Printf("search for parts with data for %d series", len(tsids))
 	if err != nil {
@@ -212,16 +212,12 @@ func (s *Search) NextMetricBlock() bool {
 				// Skip the block, since it contains only data outside the configured retention.
 				continue
 			}
-			var err error
-			s.MetricBlockRef.MetricName, err = s.idb.searchMetricNameWithCache(s.MetricBlockRef.MetricName[:0], tsid.MetricID)
-			if err != nil {
-				if err == io.EOF {
-					// Skip missing metricName for tsid.MetricID.
-					// It should be automatically fixed. See indexDB.searchMetricNameWithCache for details.
-					continue
-				}
-				s.err = err
-				return false
+			var ok bool
+			s.MetricBlockRef.MetricName, ok = s.idb.searchMetricNameWithCache(s.MetricBlockRef.MetricName[:0], tsid.MetricID)
+			if !ok {
+				// Skip missing metricName for tsid.MetricID.
+				// It should be automatically fixed. See indexDB.searchMetricNameWithCache for details.
+				continue
 			}
 			s.prevMetricID = tsid.MetricID
 		}
@@ -260,6 +256,10 @@ func (sq *SearchQuery) GetTimeRange() TimeRange {
 
 // NewSearchQuery creates new search query for the given args.
 func NewSearchQuery(start, end int64, tagFilterss [][]TagFilter, maxMetrics int) *SearchQuery {
+	if start < 0 {
+		// This is needed for https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5553
+		start = 0
+	}
 	if maxMetrics <= 0 {
 		maxMetrics = 2e9
 	}
@@ -282,7 +282,7 @@ type TagFilter struct {
 // String returns string representation of tf.
 func (tf *TagFilter) String() string {
 	op := tf.getOp()
-	value := bytesutil.LimitStringLen(string(tf.Value), 60)
+	value := stringsutil.LimitStringLen(string(tf.Value), 60)
 	if len(tf.Key) == 0 {
 		return fmt.Sprintf("__name__%s%q", op, value)
 	}
@@ -448,7 +448,6 @@ func checkSearchDeadlineAndPace(deadline uint64) error {
 	if fasttime.UnixTimestamp() > deadline {
 		return ErrDeadlineExceeded
 	}
-	storagepacelimiter.Search.WaitIfNeeded()
 	return nil
 }
 

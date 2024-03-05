@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -12,12 +13,15 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
-var enableTCP6 = flag.Bool("enableTCP6", false, "Whether to enable IPv6 for listening and dialing. By default only IPv4 TCP and UDP is used")
+var enableTCP6 = flag.Bool("enableTCP6", false, "Whether to enable IPv6 for listening and dialing. By default, only IPv4 TCP and UDP are used")
 
 // NewTCPListener returns new TCP listener for the given addr and optional tlsConfig.
 //
-// name is used for metrics registered in ms. Each listener in the program must have distinct name.
-func NewTCPListener(name, addr string, tlsConfig *tls.Config) (*TCPListener, error) {
+// name is used for metrics. Each listener in the program must have a distinct name.
+//
+// If useProxyProtocol is set to true, then the returned listener accepts TCP connections via proxy protocol.
+// See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
+func NewTCPListener(name, addr string, useProxyProtocol bool, tlsConfig *tls.Config) (*TCPListener, error) {
 	network := GetTCPNetwork()
 	ln, err := net.Listen(network, addr)
 	if err != nil {
@@ -28,7 +32,8 @@ func NewTCPListener(name, addr string, tlsConfig *tls.Config) (*TCPListener, err
 	}
 	ms := metrics.GetDefaultSet()
 	tln := &TCPListener{
-		Listener: ln,
+		Listener:         ln,
+		useProxyProtocol: useProxyProtocol,
 
 		accepts:      ms.NewCounter(fmt.Sprintf(`vm_tcplistener_accepts_total{name=%q, addr=%q}`, name, addr)),
 		acceptErrors: ms.NewCounter(fmt.Sprintf(`vm_tcplistener_errors_total{name=%q, addr=%q, type="accept"}`, name, addr)),
@@ -69,8 +74,12 @@ type TCPListener struct {
 	accepts      *metrics.Counter
 	acceptErrors *metrics.Counter
 
+	useProxyProtocol bool
+
 	connMetrics
 }
+
+var proxyProtocolReadErrorLogger = logger.WithThrottler("proxyProtocolReadError", 5*time.Second)
 
 // Accept accepts connections from the addr passed to NewTCPListener.
 func (ln *TCPListener) Accept() (net.Conn, error) {
@@ -86,6 +95,17 @@ func (ln *TCPListener) Accept() (net.Conn, error) {
 			}
 			ln.acceptErrors.Inc()
 			return nil, err
+		}
+		if ln.useProxyProtocol {
+			pConn, err := newProxyProtocolConn(conn)
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					proxyProtocolReadErrorLogger.Errorf("cannot read proxy proto conn for TCP addr %q: %s", ln.Addr(), err)
+				}
+				_ = conn.Close()
+				continue
+			}
+			conn = pConn
 		}
 		ln.conns.Inc()
 		sc := &statConn{

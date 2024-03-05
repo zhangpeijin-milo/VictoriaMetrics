@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"strings"
 	"time"
 
@@ -143,12 +144,7 @@ func (fs *FS) ListParts() ([]common.Part, error) {
 
 // DeletePart deletes part p from fs.
 func (fs *FS) DeletePart(p common.Part) error {
-	bc := fs.clientForPart(p)
-	ctx := context.Background()
-	if _, err := bc.Delete(ctx, &blob.DeleteOptions{}); err != nil {
-		return fmt.Errorf("cannot delete %q at %s (remote path %q): %w", p.Path, fs, bc.URL(), err)
-	}
-	return nil
+	return fs.delete(p.RemotePath(fs.Dir))
 }
 
 // RemoveEmptyDirs recursively removes empty dirs in fs.
@@ -173,17 +169,44 @@ func (fs *FS) CopyPart(srcFS common.OriginFS, p common.Part) error {
 		Write:  true,
 	}
 
-	t, err := sbc.GetSASURL(ssCopyPermission, time.Now().Add(-10*time.Minute), time.Now().Add(30*time.Minute))
+	startTime := time.Now().Add(-10 * time.Minute)
+	o := &blob.GetSASURLOptions{
+		StartTime: &startTime,
+	}
+	t, err := sbc.GetSASURL(ssCopyPermission, time.Now().Add(30*time.Minute), o)
 	if err != nil {
 		return fmt.Errorf("failed to generate SAS token of src %q: %w", p.Path, err)
 	}
 
-	// Hotfix for SDK issue: https://github.com/Azure/azure-sdk-for-go/issues/19245
-	t = strings.Replace(t, "/?", "?", -1)
 	ctx := context.Background()
-	_, err = dbc.CopyFromURL(ctx, t, &blob.CopyFromURLOptions{})
+
+	// In order to support copy of files larger than 256MB, we need to use the async copy
+	// Ref: https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob-from-url
+	_, err = dbc.StartCopyFromURL(ctx, t, &blob.StartCopyFromURLOptions{})
 	if err != nil {
-		return fmt.Errorf("cannot copy %q from %s to %s: %w", p.Path, src, fs, err)
+		return fmt.Errorf("cannot start async copy %q from %s to %s: %w", p.Path, src, fs, err)
+	}
+
+	var copyStatus *blob.CopyStatusType
+	var copyStatusDescription *string
+	for {
+		r, err := dbc.GetProperties(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to check copy status, cannot get properties of %q at %s: %w", p.Path, fs, err)
+		}
+
+		// After the copy will be finished status will be changed to success/failed/aborted
+		// Ref: https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-properties#response-headers - x-ms-copy-status
+		if *r.CopyStatus != blob.CopyStatusTypePending {
+			copyStatus = r.CopyStatus
+			copyStatusDescription = r.CopyStatusDescription
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	if *copyStatus != blob.CopyStatusTypeSuccess {
+		return fmt.Errorf("copy of %q from %s to %s failed: expected status %q, received %q (description: %q)", p.Path, src, fs, blob.CopyStatusTypeSuccess, *copyStatus, *copyStatusDescription)
 	}
 
 	return nil
@@ -250,15 +273,59 @@ func (fs *FS) DeleteFile(filePath string) error {
 		return nil
 	}
 
-	path := fs.Dir + filePath
-	bc := fs.clientForPath(path)
-	if err != nil {
-		return err
+	path := path.Join(fs.Dir, filePath)
+	return fs.delete(path)
+}
+
+func (fs *FS) delete(path string) error {
+	if *common.DeleteAllObjectVersions {
+		return fs.deleteObjectWithGenerations(path)
 	}
+	return fs.deleteObject(path)
+}
+
+func (fs *FS) deleteObjectWithGenerations(path string) error {
+	pager := fs.client.NewListBlobsFlatPager(&azblob.ListBlobsFlatOptions{
+		Prefix: &path,
+		Include: azblob.ListBlobsInclude{
+			Versions: true,
+		},
+	})
+
+	ctx := context.Background()
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("cannot list blobs at %s (remote path %q): %w", path, fs.Container, err)
+		}
+
+		for _, v := range resp.Segment.BlobItems {
+			var c *blob.Client
+			// Either versioning is disabled or we are deleting the current version
+			if v.VersionID == nil || (v.VersionID != nil && v.IsCurrentVersion != nil && *v.IsCurrentVersion) {
+				c = fs.client.NewBlobClient(*v.Name)
+			} else {
+				c, err = fs.client.NewBlobClient(*v.Name).WithVersionID(*v.VersionID)
+				if err != nil {
+					return fmt.Errorf("cannot read blob at %q at %s: %w", path, fs.Container, err)
+				}
+			}
+
+			if _, err := c.Delete(ctx, nil); err != nil {
+				return fmt.Errorf("cannot delete %q at %s: %w", path, fs.Container, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (fs *FS) deleteObject(path string) error {
+	bc := fs.clientForPath(path)
 
 	ctx := context.Background()
 	if _, err := bc.Delete(ctx, nil); err != nil {
-		return fmt.Errorf("cannot delete %q at %s (remote path %q): %w", filePath, fs, bc.URL(), err)
+		return fmt.Errorf("cannot delete %q at %s: %w", bc.URL(), fs, err)
 	}
 	return nil
 }
@@ -267,7 +334,7 @@ func (fs *FS) DeleteFile(filePath string) error {
 //
 // The file is overwritten if it exists.
 func (fs *FS) CreateFile(filePath string, data []byte) error {
-	path := fs.Dir + filePath
+	path := path.Join(fs.Dir, filePath)
 	bc := fs.clientForPath(path)
 
 	ctx := context.Background()
@@ -282,22 +349,37 @@ func (fs *FS) CreateFile(filePath string, data []byte) error {
 	return nil
 }
 
-// HasFile returns ture if filePath exists at fs.
+// HasFile returns true if filePath exists at fs.
 func (fs *FS) HasFile(filePath string) (bool, error) {
-	path := fs.Dir + filePath
-
+	path := path.Join(fs.Dir, filePath)
 	bc := fs.clientForPath(path)
 
 	ctx := context.Background()
 	_, err := bc.GetProperties(ctx, nil)
-	logger.Errorf("GetProperties(%q) returned %s", bc.URL(), err)
 	var azerr *azcore.ResponseError
 	if errors.As(err, &azerr) {
 		if azerr.ErrorCode == storageErrorCodeBlobNotFound {
 			return false, nil
 		}
+		logger.Errorf("GetProperties(%q) returned %s", bc.URL(), err)
 		return false, fmt.Errorf("unexpected error when obtaining properties for %q at %s (remote path %q): %w", filePath, fs, bc.URL(), err)
 	}
 
 	return true, nil
+}
+
+// ReadFile returns the content of filePath at fs.
+func (fs *FS) ReadFile(filePath string) ([]byte, error) {
+	resp, err := fs.clientForPath(fs.Dir+filePath).DownloadStream(context.Background(), &blob.DownloadStreamOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("cannot download %q at %s (remote dir %q): %w", filePath, fs, fs.Dir, err)
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %q at %s (remote dir %q): %w", filePath, fs, fs.Dir, err)
+	}
+
+	return b, nil
 }

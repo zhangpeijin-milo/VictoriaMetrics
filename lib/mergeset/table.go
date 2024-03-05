@@ -1,8 +1,10 @@
 package mergeset
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,20 +14,23 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storagepacelimiter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 )
 
-// maxParts is the maximum number of parts in the table.
+// maxInmemoryParts is the maximum number of inmemory parts in the table.
+//
+// This limit allows reducing CPU usage under high ingestion rate.
+// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/5212
 //
 // This number may be reached when the insertion pace outreaches merger pace.
-const maxParts = 512
+// If this number is reached, then the data ingestion is paused until background
+// mergers reduce the number of parts below this number.
+const maxInmemoryParts = 30
 
 // Default number of parts to merge at once.
 //
@@ -33,18 +38,29 @@ const maxParts = 512
 // See appendPartsToMerge tests for details.
 const defaultPartsToMerge = 15
 
-// The final number of parts to merge at once.
-//
-// It must be smaller than defaultPartsToMerge.
-// Lower value improves select performance at the cost of increased
-// write amplification.
-const finalPartsToMerge = 2
-
 // maxPartSize is the maximum part size in bytes.
 //
 // This number should be limited by the amount of time required to merge parts of this summary size.
 // The required time shouldn't exceed a day.
 const maxPartSize = 400e9
+
+// The interval for flushing buffered data to parts, so it becomes visible to search.
+const pendingItemsFlushInterval = time.Second
+
+// The interval for guaranteed flush of recently ingested data from memory to on-disk parts,
+// so they survive process crash.
+var dataFlushInterval = 5 * time.Second
+
+// SetDataFlushInterval sets the interval for guaranteed flush of recently ingested data from memory to disk.
+//
+// The data can be flushed from memory to disk more frequently if it doesn't fit the memory limit.
+//
+// This function must be called before initializing the indexdb.
+func SetDataFlushInterval(d time.Duration) {
+	if d > pendingItemsFlushInterval {
+		dataFlushInterval = d
+	}
+}
 
 // maxItemsPerCachedPart is the maximum items per created part by the merge,
 // which must be cached in the OS page cache.
@@ -65,64 +81,78 @@ func maxItemsPerCachedPart() uint64 {
 	return maxItems
 }
 
-// The interval for flushing (converting) recent raw items into parts,
-// so they become visible to search.
-const rawItemsFlushInterval = time.Second
-
 // Table represents mergeset table.
 type Table struct {
-	// Atomically updated counters must go first in the struct, so they are properly
-	// aligned to 8 bytes on 32-bit architectures.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212
+	activeInmemoryMerges atomic.Int64
+	activeFileMerges     atomic.Int64
 
-	activeMerges        uint64
-	mergesCount         uint64
-	itemsMerged         uint64
-	assistedMerges      uint64
-	itemsAdded          uint64
-	itemsAddedSizeBytes uint64
+	inmemoryMergesCount atomic.Uint64
+	fileMergesCount     atomic.Uint64
 
-	mergeIdx uint64
+	inmemoryItemsMerged atomic.Uint64
+	fileItemsMerged     atomic.Uint64
+
+	itemsAdded          atomic.Uint64
+	itemsAddedSizeBytes atomic.Uint64
+
+	inmemoryPartsLimitReachedCount atomic.Uint64
+
+	mergeIdx atomic.Uint64
 
 	path string
 
 	flushCallback         func()
-	flushCallbackWorkerWG sync.WaitGroup
-	needFlushCallbackCall uint32
+	needFlushCallbackCall atomic.Bool
 
 	prepareBlock PrepareBlockCallback
-	isReadOnly   *uint32
-
-	partsLock sync.Mutex
-	parts     []*partWrapper
+	isReadOnly   *atomic.Bool
 
 	// rawItems contains recently added items that haven't been converted to parts yet.
 	//
-	// rawItems aren't used in search for performance reasons
+	// rawItems are converted to inmemoryParts at least every pendingItemsFlushInterval or when rawItems becomes full.
+	//
+	// rawItems aren't visible for search due to performance reasons.
 	rawItems rawItemsShards
 
-	snapshotLock sync.RWMutex
+	// partsLock protects inmemoryParts and fileParts.
+	partsLock sync.Mutex
 
-	flockF *os.File
+	// inmemoryParts contains inmemory parts, which are visible for search.
+	inmemoryParts []*partWrapper
 
+	// fileParts contains file-backed parts, which are visible for search.
+	fileParts []*partWrapper
+
+	// inmemoryPartsLimitCh limits the number of inmemory parts to maxInmemoryParts
+	// in order to prevent from data ingestion slowdown as described at https://github.com/VictoriaMetrics/VictoriaMetrics/pull/5212
+	inmemoryPartsLimitCh chan struct{}
+
+	// stopCh is used for notifying all the background workers to stop.
+	//
+	// It must be closed under partsLock in order to prevent from calling wg.Add()
+	// after stopCh is closed.
 	stopCh chan struct{}
 
+	// wg is used for waiting for all the background workers to stop.
+	//
+	// wg.Add() must be called under partsLock after checking whether stopCh isn't closed.
+	// This should prevent from calling wg.Add() after stopCh is closed and wg.Wait() is called.
+	wg sync.WaitGroup
+
 	// Use syncwg instead of sync, since Add/Wait may be called from concurrent goroutines.
-	partMergersWG syncwg.WaitGroup
-
-	rawItemsFlusherWG sync.WaitGroup
-
-	convertersWG sync.WaitGroup
-
-	// Use syncwg instead of sync, since Add/Wait may be called from concurrent goroutines.
-	rawItemsPendingFlushesWG syncwg.WaitGroup
+	flushPendingItemsWG syncwg.WaitGroup
 }
 
 type rawItemsShards struct {
-	shardIdx uint32
+	flushDeadlineMs atomic.Int64
+
+	shardIdx atomic.Uint32
 
 	// shards reduce lock contention when adding rows on multi-CPU systems.
 	shards []rawItemsShard
+
+	ibsToFlushLock sync.Mutex
+	ibsToFlush     []*inmemoryBlock
 }
 
 // The number of shards for rawItems per table.
@@ -134,7 +164,7 @@ var rawItemsShardsPerTable = func() int {
 	if multiplier > 16 {
 		multiplier = 16
 	}
-	return (cpus*multiplier + 1) / 2
+	return cpus * multiplier
 }()
 
 const maxBlocksPerShard = 256
@@ -143,12 +173,37 @@ func (riss *rawItemsShards) init() {
 	riss.shards = make([]rawItemsShard, rawItemsShardsPerTable)
 }
 
-func (riss *rawItemsShards) addItems(tb *Table, items [][]byte) error {
-	n := atomic.AddUint32(&riss.shardIdx, 1)
+func (riss *rawItemsShards) addItems(tb *Table, items [][]byte) {
 	shards := riss.shards
-	idx := n % uint32(len(shards))
-	shard := &shards[idx]
-	return shard.addItems(tb, items)
+	shardsLen := uint32(len(shards))
+	for len(items) > 0 {
+		n := riss.shardIdx.Add(1)
+		idx := n % shardsLen
+		tailItems, ibsToFlush := shards[idx].addItems(items)
+		riss.addIbsToFlush(tb, ibsToFlush)
+		items = tailItems
+	}
+}
+
+func (riss *rawItemsShards) addIbsToFlush(tb *Table, ibsToFlush []*inmemoryBlock) {
+	if len(ibsToFlush) == 0 {
+		return
+	}
+
+	var ibsToMerge []*inmemoryBlock
+
+	riss.ibsToFlushLock.Lock()
+	if len(riss.ibsToFlush) == 0 {
+		riss.updateFlushDeadline()
+	}
+	riss.ibsToFlush = append(riss.ibsToFlush, ibsToFlush...)
+	if len(riss.ibsToFlush) >= maxBlocksPerShard*cgroup.AvailableCPUs() {
+		ibsToMerge = ibsToFlush
+		riss.ibsToFlush = nil
+	}
+	riss.ibsToFlushLock.Unlock()
+
+	tb.flushBlocksToInmemoryParts(ibsToMerge, false)
 }
 
 func (riss *rawItemsShards) Len() int {
@@ -159,9 +214,12 @@ func (riss *rawItemsShards) Len() int {
 	return n
 }
 
+func (riss *rawItemsShards) updateFlushDeadline() {
+	riss.flushDeadlineMs.Store(time.Now().Add(pendingItemsFlushInterval).UnixMilli())
+}
+
 type rawItemsShardNopad struct {
-	// Put lastFlushTime to the top in order to avoid unaligned memory access on 32-bit architectures
-	lastFlushTime uint64
+	flushDeadlineMs atomic.Int64
 
 	mu  sync.Mutex
 	ibs []*inmemoryBlock
@@ -185,67 +243,89 @@ func (ris *rawItemsShard) Len() int {
 	return n
 }
 
-func (ris *rawItemsShard) addItems(tb *Table, items [][]byte) error {
-	var err error
-	var blocksToFlush []*inmemoryBlock
+func (ris *rawItemsShard) addItems(items [][]byte) ([][]byte, []*inmemoryBlock) {
+	var ibsToFlush []*inmemoryBlock
+	var tailItems [][]byte
 
 	ris.mu.Lock()
 	ibs := ris.ibs
 	if len(ibs) == 0 {
-		ib := getInmemoryBlock()
-		ibs = append(ibs, ib)
+		ibs = append(ibs, &inmemoryBlock{})
+		ris.updateFlushDeadline()
 		ris.ibs = ibs
 	}
 	ib := ibs[len(ibs)-1]
-	for _, item := range items {
-		if !ib.Add(item) {
-			ib = getInmemoryBlock()
-			if !ib.Add(item) {
-				putInmemoryBlock(ib)
-				err = fmt.Errorf("cannot insert an item %q into an empty inmemoryBlock; it looks like the item is too large? len(item)=%d", item, len(item))
-				break
-			}
+	for i, item := range items {
+		if ib.Add(item) {
+			continue
+		}
+		if len(ibs) >= maxBlocksPerShard {
+			ibsToFlush = append(ibsToFlush, ibs...)
+			ibs = make([]*inmemoryBlock, 0, maxBlocksPerShard)
+			tailItems = items[i:]
+			break
+		}
+		ib = &inmemoryBlock{}
+		if ib.Add(item) {
 			ibs = append(ibs, ib)
-			ris.ibs = ibs
+			continue
 		}
-	}
-	if len(ibs) >= maxBlocksPerShard {
-		blocksToFlush = append(blocksToFlush, ibs...)
-		for i := range ibs {
-			ibs[i] = nil
+
+		// Skip too long item
+		itemPrefix := item
+		if len(itemPrefix) > 128 {
+			itemPrefix = itemPrefix[:128]
 		}
-		ris.ibs = ibs[:0]
-		atomic.StoreUint64(&ris.lastFlushTime, fasttime.UnixTimestamp())
+		tooLongItemLogger.Errorf("skipping adding too long item to indexdb: len(item)=%d; it souldn't exceed %d bytes; item prefix=%q", len(item), maxInmemoryBlockSize, itemPrefix)
 	}
+	ris.ibs = ibs
 	ris.mu.Unlock()
 
-	tb.mergeRawItemsBlocks(blocksToFlush, false)
-	return err
+	return tailItems, ibsToFlush
 }
 
+func (ris *rawItemsShard) updateFlushDeadline() {
+	ris.flushDeadlineMs.Store(time.Now().Add(pendingItemsFlushInterval).UnixMilli())
+}
+
+var tooLongItemLogger = logger.WithThrottler("tooLongItem", 5*time.Second)
+
 type partWrapper struct {
+	// refCount is the number of references to partWrapper
+	refCount atomic.Int32
+
+	// mustDrop marks partWrapper for deletion.
+	// This field should be updated only after partWrapper
+	// was removed from the list of active parts.
+	mustDrop atomic.Bool
+
 	p *part
 
 	mp *inmemoryPart
 
-	refCount uint64
-
 	isInMerge bool
+
+	// The deadline when the in-memory part must be flushed to disk.
+	flushToDiskDeadline time.Time
 }
 
 func (pw *partWrapper) incRef() {
-	atomic.AddUint64(&pw.refCount, 1)
+	pw.refCount.Add(1)
 }
 
 func (pw *partWrapper) decRef() {
-	n := atomic.AddUint64(&pw.refCount, ^uint64(0))
-	if int64(n) < 0 {
-		logger.Panicf("BUG: pw.refCount must be bigger than 0; got %d", int64(n))
+	n := pw.refCount.Add(-1)
+	if n < 0 {
+		logger.Panicf("BUG: pw.refCount must be bigger than 0; got %d", n)
 	}
 	if n > 0 {
 		return
 	}
 
+	deletePath := ""
+	if pw.mp == nil && pw.mustDrop.Load() {
+		deletePath = pw.p.path
+	}
 	if pw.mp != nil {
 		// Do not return pw.mp to pool via putInmemoryPart(),
 		// since pw.mp size may be too big compared to other entries stored in the pool.
@@ -254,9 +334,13 @@ func (pw *partWrapper) decRef() {
 	}
 	pw.p.MustClose()
 	pw.p = nil
+
+	if deletePath != "" {
+		fs.MustRemoveAll(deletePath)
+	}
 }
 
-// OpenTable opens a table on the given path.
+// MustOpenTable opens a table on the given path.
 //
 // Optional flushCallback is called every time new data batch is flushed
 // to the underlying storage and becomes visible to search.
@@ -265,141 +349,181 @@ func (pw *partWrapper) decRef() {
 // to persistent storage.
 //
 // The table is created if it doesn't exist yet.
-func OpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallback, isReadOnly *uint32) (*Table, error) {
+func MustOpenTable(path string, flushCallback func(), prepareBlock PrepareBlockCallback, isReadOnly *atomic.Bool) *Table {
 	path = filepath.Clean(path)
-	logger.Infof("opening table %q...", path)
-	startTime := time.Now()
 
 	// Create a directory for the table if it doesn't exist yet.
-	if err := fs.MkdirAllIfNotExist(path); err != nil {
-		return nil, fmt.Errorf("cannot create directory %q: %w", path, err)
-	}
-
-	// Protect from concurrent opens.
-	flockF, err := fs.CreateFlockFile(path)
-	if err != nil {
-		return nil, err
-	}
+	fs.MustMkdirIfNotExist(path)
 
 	// Open table parts.
-	pws, err := openParts(path)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open table parts at %q: %w", path, err)
-	}
+	pws := mustOpenParts(path)
 
 	tb := &Table{
-		path:          path,
-		flushCallback: flushCallback,
-		prepareBlock:  prepareBlock,
-		isReadOnly:    isReadOnly,
-		parts:         pws,
-		mergeIdx:      uint64(time.Now().UnixNano()),
-		flockF:        flockF,
-		stopCh:        make(chan struct{}),
+		path:                 path,
+		flushCallback:        flushCallback,
+		prepareBlock:         prepareBlock,
+		isReadOnly:           isReadOnly,
+		fileParts:            pws,
+		inmemoryPartsLimitCh: make(chan struct{}, maxInmemoryParts),
+		stopCh:               make(chan struct{}),
 	}
+	tb.mergeIdx.Store(uint64(time.Now().UnixNano()))
 	tb.rawItems.init()
-	tb.startPartMergers()
-	tb.startRawItemsFlusher()
+	tb.startBackgroundWorkers()
 
-	var m TableMetrics
-	tb.UpdateMetrics(&m)
-	logger.Infof("table %q has been opened in %.3f seconds; partsCount: %d; blocksCount: %d, itemsCount: %d; sizeBytes: %d",
-		path, time.Since(startTime).Seconds(), m.PartsCount, m.BlocksCount, m.ItemsCount, m.SizeBytes)
+	return tb
+}
 
-	tb.convertersWG.Add(1)
+func (tb *Table) startBackgroundWorkers() {
+	// Start file parts mergers, so they could start merging unmerged parts if needed.
+	// There is no need in starting in-memory parts mergers, since there are no in-memory parts yet.
+	tb.startFilePartsMergers()
+
+	tb.startPendingItemsFlusher()
+	tb.startInmemoryPartsFlusher()
+	tb.startFlushCallbackWorker()
+}
+
+func (tb *Table) startInmemoryPartsMergers() {
+	tb.partsLock.Lock()
+	for i := 0; i < cap(inmemoryPartsConcurrencyCh); i++ {
+		tb.startInmemoryPartsMergerLocked()
+	}
+	tb.partsLock.Unlock()
+}
+
+func (tb *Table) startInmemoryPartsMergerLocked() {
+	select {
+	case <-tb.stopCh:
+		return
+	default:
+	}
+	tb.wg.Add(1)
 	go func() {
-		tb.convertToV1280()
-		tb.convertersWG.Done()
+		tb.inmemoryPartsMerger()
+		tb.wg.Done()
 	}()
+}
 
-	if flushCallback != nil {
-		tb.flushCallbackWorkerWG.Add(1)
-		go func() {
-			// call flushCallback once per 10 seconds in order to improve the effectiveness of caches,
-			// which are reset by the flushCallback.
-			tc := time.NewTicker(10 * time.Second)
-			for {
-				select {
-				case <-tb.stopCh:
+func (tb *Table) startFilePartsMergers() {
+	tb.partsLock.Lock()
+	for i := 0; i < cap(filePartsConcurrencyCh); i++ {
+		tb.startFilePartsMergerLocked()
+	}
+	tb.partsLock.Unlock()
+}
+
+func (tb *Table) startFilePartsMergerLocked() {
+	select {
+	case <-tb.stopCh:
+		return
+	default:
+	}
+	tb.wg.Add(1)
+	go func() {
+		tb.filePartsMerger()
+		tb.wg.Done()
+	}()
+}
+
+func (tb *Table) startPendingItemsFlusher() {
+	tb.wg.Add(1)
+	go func() {
+		tb.pendingItemsFlusher()
+		tb.wg.Done()
+	}()
+}
+
+func (tb *Table) startInmemoryPartsFlusher() {
+	tb.wg.Add(1)
+	go func() {
+		tb.inmemoryPartsFlusher()
+		tb.wg.Done()
+	}()
+}
+
+func (tb *Table) startFlushCallbackWorker() {
+	if tb.flushCallback == nil {
+		return
+	}
+
+	tb.wg.Add(1)
+	go func() {
+		// call flushCallback once per 10 seconds in order to improve the effectiveness of caches,
+		// which are reset by the flushCallback.
+		d := timeutil.AddJitterToDuration(time.Second * 10)
+		tc := time.NewTicker(d)
+		for {
+			select {
+			case <-tb.stopCh:
+				tb.flushCallback()
+				tb.wg.Done()
+				return
+			case <-tc.C:
+				if tb.needFlushCallbackCall.CompareAndSwap(true, false) {
 					tb.flushCallback()
-					tb.flushCallbackWorkerWG.Done()
-					return
-				case <-tc.C:
-					if atomic.CompareAndSwapUint32(&tb.needFlushCallbackCall, 1, 0) {
-						tb.flushCallback()
-					}
 				}
 			}
-		}()
-	}
+		}
+	}()
+}
 
-	return tb, nil
+var (
+	inmemoryPartsConcurrencyCh = make(chan struct{}, getInmemoryPartsConcurrency())
+	filePartsConcurrencyCh     = make(chan struct{}, getFilePartsConcurrency())
+)
+
+func getInmemoryPartsConcurrency() int {
+	// The concurrency for processing in-memory parts must equal to the number of CPU cores,
+	// since these operations are CPU-bound.
+	return cgroup.AvailableCPUs()
+}
+
+func getFilePartsConcurrency() int {
+	n := cgroup.AvailableCPUs()
+	if n < 4 {
+		// Allow at least 4 concurrent workers for file parts on systems
+		// with less than 4 CPU cores in order to be able to make small file merges
+		// when big file merges are in progress.
+		return 4
+	}
+	return n
 }
 
 // MustClose closes the table.
 func (tb *Table) MustClose() {
+	// Notify background workers to stop.
+	// The tb.partsLock is aquired in order to guarantee that tb.wg.Add() isn't called
+	// after tb.stopCh is closed and tb.wg.Wait() is called below.
+	tb.partsLock.Lock()
 	close(tb.stopCh)
-
-	logger.Infof("waiting for raw items flusher to stop on %q...", tb.path)
-	startTime := time.Now()
-	tb.rawItemsFlusherWG.Wait()
-	logger.Infof("raw items flusher stopped in %.3f seconds on %q", time.Since(startTime).Seconds(), tb.path)
-
-	logger.Infof("waiting for converters to stop on %q...", tb.path)
-	startTime = time.Now()
-	tb.convertersWG.Wait()
-	logger.Infof("converters stopped in %.3f seconds on %q", time.Since(startTime).Seconds(), tb.path)
-
-	logger.Infof("waiting for part mergers to stop on %q...", tb.path)
-	startTime = time.Now()
-	tb.partMergersWG.Wait()
-	logger.Infof("part mergers stopped in %.3f seconds on %q", time.Since(startTime).Seconds(), tb.path)
-
-	logger.Infof("flushing inmemory parts to files on %q...", tb.path)
-	startTime = time.Now()
-
-	// Flush raw items the last time before exit.
-	tb.flushRawItems(true)
-
-	// Flush inmemory parts to disk.
-	var pws []*partWrapper
-	tb.partsLock.Lock()
-	for _, pw := range tb.parts {
-		if pw.mp == nil {
-			continue
-		}
-		if pw.isInMerge {
-			logger.Panicf("BUG: the inmemory part %s mustn't be in merge after stopping parts merger in %q", &pw.mp.ph, tb.path)
-		}
-		pw.isInMerge = true
-		pws = append(pws, pw)
-	}
 	tb.partsLock.Unlock()
 
-	if err := tb.mergePartsOptimal(pws, nil); err != nil {
-		logger.Panicf("FATAL: cannot flush inmemory parts to files in %q: %s", tb.path, err)
-	}
-	logger.Infof("%d inmemory parts have been flushed to files in %.3f seconds on %q", len(pws), time.Since(startTime).Seconds(), tb.path)
+	// Wait for background workers to stop.
+	tb.wg.Wait()
 
-	logger.Infof("waiting for flush callback worker to stop on %q...", tb.path)
-	startTime = time.Now()
-	tb.flushCallbackWorkerWG.Wait()
-	logger.Infof("flush callback worker stopped in %.3f seconds on %q", time.Since(startTime).Seconds(), tb.path)
+	// Flush the remaining in-memory items to files.
+	tb.flushInmemoryItemsToFiles()
 
-	// Remove references to parts from the tb, so they may be eventually closed
-	// after all the searches are done.
+	// Remove references to parts from the tb, so they may be eventually closed after all the searches are done.
 	tb.partsLock.Lock()
-	parts := tb.parts
-	tb.parts = nil
+
+	if n := tb.rawItems.Len(); n > 0 {
+		logger.Panicf("BUG: raw items must be empty at this stage; got %d items", n)
+	}
+
+	if n := len(tb.inmemoryParts); n > 0 {
+		logger.Panicf("BUG: in-memory parts must be empty at this stage; got %d parts", n)
+	}
+	tb.inmemoryParts = nil
+
+	fileParts := tb.fileParts
+	tb.fileParts = nil
+
 	tb.partsLock.Unlock()
 
-	for _, pw := range parts {
+	for _, pw := range fileParts {
 		pw.decRef()
-	}
-
-	// Release flockF
-	if err := tb.flockF.Close(); err != nil {
-		logger.Panicf("FATAL:cannot close %q: %s", tb.flockF.Name(), err)
 	}
 }
 
@@ -410,20 +534,33 @@ func (tb *Table) Path() string {
 
 // TableMetrics contains essential metrics for the Table.
 type TableMetrics struct {
-	ActiveMerges        uint64
-	MergesCount         uint64
-	ItemsMerged         uint64
-	AssistedMerges      uint64
+	ActiveInmemoryMerges uint64
+	ActiveFileMerges     uint64
+
+	InmemoryMergesCount uint64
+	FileMergesCount     uint64
+
+	InmemoryItemsMerged uint64
+	FileItemsMerged     uint64
+
 	ItemsAdded          uint64
 	ItemsAddedSizeBytes uint64
 
+	InmemoryPartsLimitReachedCount uint64
+
 	PendingItems uint64
 
-	PartsCount uint64
+	InmemoryPartsCount uint64
+	FilePartsCount     uint64
 
-	BlocksCount uint64
-	ItemsCount  uint64
-	SizeBytes   uint64
+	InmemoryBlocksCount uint64
+	FileBlocksCount     uint64
+
+	InmemoryItemsCount uint64
+	FileItemsCount     uint64
+
+	InmemorySizeBytes uint64
+	FileSizeBytes     uint64
 
 	DataBlocksCacheSize         uint64
 	DataBlocksCacheSizeBytes    uint64
@@ -440,27 +577,47 @@ type TableMetrics struct {
 	PartsRefCount uint64
 }
 
+// TotalItemsCount returns the total number of items in the table.
+func (tm *TableMetrics) TotalItemsCount() uint64 {
+	return tm.InmemoryItemsCount + tm.FileItemsCount
+}
+
 // UpdateMetrics updates m with metrics from tb.
 func (tb *Table) UpdateMetrics(m *TableMetrics) {
-	m.ActiveMerges += atomic.LoadUint64(&tb.activeMerges)
-	m.MergesCount += atomic.LoadUint64(&tb.mergesCount)
-	m.ItemsMerged += atomic.LoadUint64(&tb.itemsMerged)
-	m.AssistedMerges += atomic.LoadUint64(&tb.assistedMerges)
-	m.ItemsAdded += atomic.LoadUint64(&tb.itemsAdded)
-	m.ItemsAddedSizeBytes += atomic.LoadUint64(&tb.itemsAddedSizeBytes)
+	m.ActiveInmemoryMerges += uint64(tb.activeInmemoryMerges.Load())
+	m.ActiveFileMerges += uint64(tb.activeFileMerges.Load())
+
+	m.InmemoryMergesCount += tb.inmemoryMergesCount.Load()
+	m.FileMergesCount += tb.fileMergesCount.Load()
+
+	m.InmemoryItemsMerged += tb.inmemoryItemsMerged.Load()
+	m.FileItemsMerged += tb.fileItemsMerged.Load()
+
+	m.ItemsAdded += tb.itemsAdded.Load()
+	m.ItemsAddedSizeBytes += tb.itemsAddedSizeBytes.Load()
+
+	m.InmemoryPartsLimitReachedCount += tb.inmemoryPartsLimitReachedCount.Load()
 
 	m.PendingItems += uint64(tb.rawItems.Len())
 
 	tb.partsLock.Lock()
-	m.PartsCount += uint64(len(tb.parts))
-	for _, pw := range tb.parts {
+
+	m.InmemoryPartsCount += uint64(len(tb.inmemoryParts))
+	for _, pw := range tb.inmemoryParts {
 		p := pw.p
+		m.InmemoryBlocksCount += p.ph.blocksCount
+		m.InmemoryItemsCount += p.ph.itemsCount
+		m.InmemorySizeBytes += p.size
+		m.PartsRefCount += uint64(pw.refCount.Load())
+	}
 
-		m.BlocksCount += p.ph.blocksCount
-		m.ItemsCount += p.ph.itemsCount
-		m.SizeBytes += p.size
-
-		m.PartsRefCount += atomic.LoadUint64(&pw.refCount)
+	m.FilePartsCount += uint64(len(tb.fileParts))
+	for _, pw := range tb.fileParts {
+		p := pw.p
+		m.FileBlocksCount += p.ph.blocksCount
+		m.FileItemsCount += p.ph.itemsCount
+		m.FileSizeBytes += p.size
+		m.PartsRefCount += uint64(pw.refCount.Load())
 	}
 	tb.partsLock.Unlock()
 
@@ -478,17 +635,17 @@ func (tb *Table) UpdateMetrics(m *TableMetrics) {
 }
 
 // AddItems adds the given items to the tb.
-func (tb *Table) AddItems(items [][]byte) error {
-	if err := tb.rawItems.addItems(tb, items); err != nil {
-		return fmt.Errorf("cannot insert data into %q: %w", tb.path, err)
-	}
-	atomic.AddUint64(&tb.itemsAdded, uint64(len(items)))
+//
+// The function ignores items with length exceeding maxInmemoryBlockSize.
+// It logs the ignored items, so users could notice and fix the issue.
+func (tb *Table) AddItems(items [][]byte) {
+	tb.rawItems.addItems(tb, items)
+	tb.itemsAdded.Add(uint64(len(items)))
 	n := 0
 	for _, item := range items {
 		n += len(item)
 	}
-	atomic.AddUint64(&tb.itemsAddedSizeBytes, uint64(n))
-	return nil
+	tb.itemsAddedSizeBytes.Add(uint64(n))
 }
 
 // getParts appends parts snapshot to dst and returns it.
@@ -496,10 +653,14 @@ func (tb *Table) AddItems(items [][]byte) error {
 // The appended parts must be released with putParts.
 func (tb *Table) getParts(dst []*partWrapper) []*partWrapper {
 	tb.partsLock.Lock()
-	for _, pw := range tb.parts {
+	for _, pw := range tb.inmemoryParts {
 		pw.incRef()
 	}
-	dst = append(dst, tb.parts...)
+	for _, pw := range tb.fileParts {
+		pw.incRef()
+	}
+	dst = append(dst, tb.inmemoryParts...)
+	dst = append(dst, tb.fileParts...)
 	tb.partsLock.Unlock()
 
 	return dst
@@ -512,142 +673,142 @@ func (tb *Table) putParts(pws []*partWrapper) {
 	}
 }
 
-func (tb *Table) startRawItemsFlusher() {
-	tb.rawItemsFlusherWG.Add(1)
-	go func() {
-		tb.rawItemsFlusher()
-		tb.rawItemsFlusherWG.Done()
-	}()
+func (tb *Table) mergeInmemoryPartsToFiles(pws []*partWrapper) error {
+	pwsLen := len(pws)
+
+	var errGlobal error
+	var errGlobalLock sync.Mutex
+	wg := getWaitGroup()
+	for len(pws) > 0 {
+		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
+		wg.Add(1)
+		inmemoryPartsConcurrencyCh <- struct{}{}
+		go func(pwsChunk []*partWrapper) {
+			defer func() {
+				<-inmemoryPartsConcurrencyCh
+				wg.Done()
+			}()
+
+			if err := tb.mergeParts(pwsChunk, nil, true); err != nil {
+				// There is no need for errors.Is(err, errForciblyStopped) check here, since stopCh=nil is passed to mergeParts.
+				errGlobalLock.Lock()
+				if errGlobal == nil {
+					errGlobal = err
+				}
+				errGlobalLock.Unlock()
+			}
+		}(pwsToMerge)
+		pws = pwsRemaining
+	}
+	wg.Wait()
+	putWaitGroup(wg)
+
+	if errGlobal != nil {
+		return fmt.Errorf("cannot optimally merge %d parts: %w", pwsLen, errGlobal)
+	}
+	return nil
 }
 
-func (tb *Table) rawItemsFlusher() {
-	ticker := time.NewTicker(rawItemsFlushInterval)
+// DebugFlush makes sure all the recently added data is visible to search.
+//
+// Note: this function doesn't store all the in-memory data to disk - it just converts
+// recently added items to searchable parts, which can be stored either in memory
+// (if they are quite small) or to persistent disk.
+//
+// This function is for debugging and testing purposes only,
+// since it may slow down data ingestion when used frequently.
+func (tb *Table) DebugFlush() {
+	tb.flushPendingItems(true)
+
+	// Wait for background flushers to finish.
+	tb.flushPendingItemsWG.Wait()
+}
+
+func (tb *Table) pendingItemsFlusher() {
+	// do not add jitter in order to guarantee flush interval
+	d := pendingItemsFlushInterval
+	ticker := time.NewTicker(d)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-tb.stopCh:
 			return
 		case <-ticker.C:
-			tb.flushRawItems(false)
+			tb.flushPendingItems(false)
 		}
 	}
 }
 
-const convertToV1280FileName = "converted-to-v1.28.0"
-
-func (tb *Table) convertToV1280() {
-	// Convert tag->metricID rows into tag->metricIDs rows when upgrading to v1.28.0+.
-	flagFilePath := tb.path + "/" + convertToV1280FileName
-	if fs.IsPathExist(flagFilePath) {
-		// The conversion has been already performed.
-		return
+func (tb *Table) inmemoryPartsFlusher() {
+	// do not add jitter in order to guarantee flush interval
+	d := dataFlushInterval
+	ticker := time.NewTicker(d)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-tb.stopCh:
+			return
+		case <-ticker.C:
+			tb.flushInmemoryPartsToFiles(false)
+		}
 	}
+}
 
-	getAllPartsForMerge := func() []*partWrapper {
-		var pws []*partWrapper
-		tb.partsLock.Lock()
-		for _, pw := range tb.parts {
-			if pw.isInMerge {
-				continue
-			}
+func (tb *Table) flushPendingItems(isFinal bool) {
+	tb.flushPendingItemsWG.Add(1)
+	tb.rawItems.flush(tb, isFinal)
+	tb.flushPendingItemsWG.Done()
+}
+
+func (tb *Table) flushInmemoryItemsToFiles() {
+	tb.flushPendingItems(true)
+	tb.flushInmemoryPartsToFiles(true)
+}
+
+func (tb *Table) flushInmemoryPartsToFiles(isFinal bool) {
+	currentTime := time.Now()
+	var pws []*partWrapper
+
+	tb.partsLock.Lock()
+	for _, pw := range tb.inmemoryParts {
+		if !pw.isInMerge && (isFinal || pw.flushToDiskDeadline.Before(currentTime)) {
 			pw.isInMerge = true
 			pws = append(pws, pw)
 		}
-		tb.partsLock.Unlock()
-		return pws
 	}
-	pws := getAllPartsForMerge()
-	if len(pws) > 0 {
-		logger.Infof("started round 1 of background conversion of %q to v1.28.0 format; merge %d parts", tb.path, len(pws))
-		startTime := time.Now()
-		if err := tb.mergePartsOptimal(pws, tb.stopCh); err != nil {
-			logger.Errorf("failed round 1 of background conversion of %q to v1.28.0 format: %s", tb.path, err)
-			return
-		}
-		logger.Infof("finished round 1 of background conversion of %q to v1.28.0 format in %.3f seconds", tb.path, time.Since(startTime).Seconds())
+	tb.partsLock.Unlock()
 
-		// The second round is needed in order to merge small blocks
-		// with tag->metricIDs rows left after the first round.
-		pws = getAllPartsForMerge()
-		logger.Infof("started round 2 of background conversion of %q to v1.28.0 format; merge %d parts", tb.path, len(pws))
-		startTime = time.Now()
-		if len(pws) > 0 {
-			if err := tb.mergePartsOptimal(pws, tb.stopCh); err != nil {
-				logger.Errorf("failed round 2 of background conversion of %q to v1.28.0 format: %s", tb.path, err)
-				return
-			}
-		}
-		logger.Infof("finished round 2 of background conversion of %q to v1.28.0 format in %.3f seconds", tb.path, time.Since(startTime).Seconds())
+	if err := tb.mergeInmemoryPartsToFiles(pws); err != nil {
+		logger.Panicf("FATAL: cannot merge in-memory parts to files: %s", err)
 	}
-
-	if err := fs.WriteFileAtomically(flagFilePath, []byte("ok"), false); err != nil {
-		logger.Panicf("FATAL: cannot create %q: %s", flagFilePath, err)
-	}
-}
-
-func (tb *Table) mergePartsOptimal(pws []*partWrapper, stopCh <-chan struct{}) error {
-	defer func() {
-		// Remove isInMerge flag from pws.
-		tb.partsLock.Lock()
-		for _, pw := range pws {
-			// Do not check for pws.isInMerge set to false,
-			// since it may be set to false in mergeParts below.
-			pw.isInMerge = false
-		}
-		tb.partsLock.Unlock()
-	}()
-	for len(pws) > defaultPartsToMerge {
-		if err := tb.mergeParts(pws[:defaultPartsToMerge], stopCh, false); err != nil {
-			return fmt.Errorf("cannot merge %d parts: %w", defaultPartsToMerge, err)
-		}
-		pws = pws[defaultPartsToMerge:]
-	}
-	if len(pws) == 0 {
-		return nil
-	}
-	if err := tb.mergeParts(pws, stopCh, false); err != nil {
-		return fmt.Errorf("cannot merge %d parts: %w", len(pws), err)
-	}
-	return nil
-}
-
-// DebugFlush flushes all the added items to the storage,
-// so they become visible to search.
-//
-// This function is only for debugging and testing.
-func (tb *Table) DebugFlush() {
-	tb.flushRawItems(true)
-
-	// Wait for background flushers to finish.
-	tb.rawItemsPendingFlushesWG.Wait()
-}
-
-func (tb *Table) flushRawItems(isFinal bool) {
-	tb.rawItems.flush(tb, isFinal)
 }
 
 func (riss *rawItemsShards) flush(tb *Table, isFinal bool) {
-	tb.rawItemsPendingFlushesWG.Add(1)
-	defer tb.rawItemsPendingFlushesWG.Done()
+	var dst []*inmemoryBlock
 
-	var blocksToFlush []*inmemoryBlock
-	for i := range riss.shards {
-		blocksToFlush = riss.shards[i].appendBlocksToFlush(blocksToFlush, tb, isFinal)
+	currentTimeMs := time.Now().UnixMilli()
+	flushDeadlineMs := riss.flushDeadlineMs.Load()
+	if isFinal || currentTimeMs >= flushDeadlineMs {
+		riss.ibsToFlushLock.Lock()
+		dst = riss.ibsToFlush
+		riss.ibsToFlush = nil
+		riss.ibsToFlushLock.Unlock()
 	}
-	tb.mergeRawItemsBlocks(blocksToFlush, isFinal)
+
+	for i := range riss.shards {
+		dst = riss.shards[i].appendBlocksToFlush(dst, currentTimeMs, isFinal)
+	}
+
+	tb.flushBlocksToInmemoryParts(dst, isFinal)
 }
 
-func (ris *rawItemsShard) appendBlocksToFlush(dst []*inmemoryBlock, tb *Table, isFinal bool) []*inmemoryBlock {
-	currentTime := fasttime.UnixTimestamp()
-	flushSeconds := int64(rawItemsFlushInterval.Seconds())
-	if flushSeconds <= 0 {
-		flushSeconds = 1
-	}
-	lastFlushTime := atomic.LoadUint64(&ris.lastFlushTime)
-	if !isFinal && currentTime <= lastFlushTime+uint64(flushSeconds) {
+func (ris *rawItemsShard) appendBlocksToFlush(dst []*inmemoryBlock, currentTimeMs int64, isFinal bool) []*inmemoryBlock {
+	flushDeadlineMs := ris.flushDeadlineMs.Load()
+	if !isFinal && currentTimeMs < flushDeadlineMs {
 		// Fast path - nothing to flush
 		return dst
 	}
+
 	// Slow path - move ris.ibs to dst
 	ris.mu.Lock()
 	ibs := ris.ibs
@@ -656,84 +817,166 @@ func (ris *rawItemsShard) appendBlocksToFlush(dst []*inmemoryBlock, tb *Table, i
 		ibs[i] = nil
 	}
 	ris.ibs = ibs[:0]
-	atomic.StoreUint64(&ris.lastFlushTime, currentTime)
 	ris.mu.Unlock()
+
 	return dst
 }
 
-func (tb *Table) mergeRawItemsBlocks(ibs []*inmemoryBlock, isFinal bool) {
+func (tb *Table) flushBlocksToInmemoryParts(ibs []*inmemoryBlock, isFinal bool) {
 	if len(ibs) == 0 {
 		return
 	}
-	tb.partMergersWG.Add(1)
-	defer tb.partMergersWG.Done()
 
-	pws := make([]*partWrapper, 0, (len(ibs)+defaultPartsToMerge-1)/defaultPartsToMerge)
+	// Merge ibs into in-memory parts.
 	var pwsLock sync.Mutex
-	var wg sync.WaitGroup
+	pws := make([]*partWrapper, 0, (len(ibs)+defaultPartsToMerge-1)/defaultPartsToMerge)
+	wg := getWaitGroup()
 	for len(ibs) > 0 {
 		n := defaultPartsToMerge
 		if n > len(ibs) {
 			n = len(ibs)
 		}
 		wg.Add(1)
-		go func(ibsPart []*inmemoryBlock) {
-			defer wg.Done()
-			pw := tb.mergeInmemoryBlocks(ibsPart)
-			if pw == nil {
-				return
+		inmemoryPartsConcurrencyCh <- struct{}{}
+		go func(ibsChunk []*inmemoryBlock) {
+			defer func() {
+				<-inmemoryPartsConcurrencyCh
+				wg.Done()
+			}()
+
+			if pw := tb.createInmemoryPart(ibsChunk); pw != nil {
+				pwsLock.Lock()
+				pws = append(pws, pw)
+				pwsLock.Unlock()
 			}
-			pw.isInMerge = true
-			pwsLock.Lock()
-			pws = append(pws, pw)
-			pwsLock.Unlock()
+			// Clear references to ibsChunk items, so they may be reclaimed faster by Go GC.
+			for i := range ibsChunk {
+				ibsChunk[i] = nil
+			}
 		}(ibs[:n])
 		ibs = ibs[n:]
 	}
 	wg.Wait()
-	if len(pws) > 0 {
-		if err := tb.mergeParts(pws, nil, true); err != nil {
-			logger.Panicf("FATAL: cannot merge raw parts: %s", err)
-		}
-		if tb.flushCallback != nil {
-			if isFinal {
-				tb.flushCallback()
+	putWaitGroup(wg)
+
+	// Merge pws into a single in-memory part.
+	maxPartSize := getMaxInmemoryPartSize()
+	for len(pws) > 1 {
+		pws = tb.mustMergeInmemoryParts(pws)
+
+		pwsRemaining := pws[:0]
+		for _, pw := range pws {
+			if pw.p.size >= maxPartSize {
+				tb.addToInmemoryParts(pw, isFinal)
 			} else {
-				atomic.CompareAndSwapUint32(&tb.needFlushCallbackCall, 0, 1)
+				pwsRemaining = append(pwsRemaining, pw)
 			}
 		}
+		pws = pwsRemaining
 	}
-
-	for {
-		tb.partsLock.Lock()
-		ok := len(tb.parts) <= maxParts
-		tb.partsLock.Unlock()
-		if ok {
-			return
-		}
-
-		// The added part exceeds maxParts count. Assist with merging other parts.
-		//
-		// Prioritize assisted merges over searches.
-		storagepacelimiter.Search.Inc()
-		err := tb.mergeExistingParts(false)
-		storagepacelimiter.Search.Dec()
-		if err == nil {
-			atomic.AddUint64(&tb.assistedMerges, 1)
-			continue
-		}
-		if errors.Is(err, errNothingToMerge) || errors.Is(err, errForciblyStopped) || errors.Is(err, errReadOnlyMode) {
-			return
-		}
-		logger.Panicf("FATAL: cannot merge small parts: %s", err)
+	if len(pws) == 1 {
+		tb.addToInmemoryParts(pws[0], isFinal)
 	}
 }
 
-func (tb *Table) mergeInmemoryBlocks(ibs []*inmemoryBlock) *partWrapper {
-	atomic.AddUint64(&tb.mergesCount, 1)
-	atomic.AddUint64(&tb.activeMerges, 1)
-	defer atomic.AddUint64(&tb.activeMerges, ^uint64(0))
+func (tb *Table) addToInmemoryParts(pw *partWrapper, isFinal bool) {
+	// Wait until the number of in-memory parts goes below maxInmemoryParts.
+	// This prevents from excess CPU usage during search in tb under high ingestion rate to tb.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/5212
+	select {
+	case tb.inmemoryPartsLimitCh <- struct{}{}:
+	default:
+		tb.inmemoryPartsLimitReachedCount.Add(1)
+		select {
+		case tb.inmemoryPartsLimitCh <- struct{}{}:
+		case <-tb.stopCh:
+		}
+	}
 
+	tb.partsLock.Lock()
+	tb.inmemoryParts = append(tb.inmemoryParts, pw)
+	tb.startInmemoryPartsMergerLocked()
+	tb.partsLock.Unlock()
+
+	if tb.flushCallback != nil {
+		if isFinal {
+			tb.flushCallback()
+		} else {
+			// Use Load in front of CompareAndSwap in order to avoid slow inter-CPU synchronization
+			// at fast path when needFlushCallbackCall is already set to true.
+			if !tb.needFlushCallbackCall.Load() {
+				tb.needFlushCallbackCall.CompareAndSwap(false, true)
+			}
+		}
+	}
+}
+
+func getWaitGroup() *sync.WaitGroup {
+	v := wgPool.Get()
+	if v == nil {
+		return &sync.WaitGroup{}
+	}
+	return v.(*sync.WaitGroup)
+}
+
+func putWaitGroup(wg *sync.WaitGroup) {
+	wgPool.Put(wg)
+}
+
+var wgPool sync.Pool
+
+func (tb *Table) mustMergeInmemoryParts(pws []*partWrapper) []*partWrapper {
+	var pwsResult []*partWrapper
+	var pwsResultLock sync.Mutex
+	wg := getWaitGroup()
+	for len(pws) > 0 {
+		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
+		wg.Add(1)
+		inmemoryPartsConcurrencyCh <- struct{}{}
+		go func(pwsChunk []*partWrapper) {
+			defer func() {
+				<-inmemoryPartsConcurrencyCh
+				wg.Done()
+			}()
+
+			pw := tb.mustMergeInmemoryPartsFinal(pwsChunk)
+
+			pwsResultLock.Lock()
+			pwsResult = append(pwsResult, pw)
+			pwsResultLock.Unlock()
+		}(pwsToMerge)
+		pws = pwsRemaining
+	}
+	wg.Wait()
+	putWaitGroup(wg)
+
+	return pwsResult
+}
+
+func (tb *Table) mustMergeInmemoryPartsFinal(pws []*partWrapper) *partWrapper {
+	if len(pws) == 0 {
+		logger.Panicf("BUG: pws must contain at least a single item")
+	}
+	if len(pws) == 1 {
+		// Nothing to merge
+		return pws[0]
+	}
+
+	bsrs := make([]*blockStreamReader, 0, len(pws))
+	for _, pw := range pws {
+		if pw.mp == nil {
+			logger.Panicf("BUG: unexpected file part")
+		}
+		bsr := getBlockStreamReader()
+		bsr.MustInitFromInmemoryPart(pw.mp)
+		bsrs = append(bsrs, bsr)
+	}
+
+	flushToDiskDeadline := getFlushToDiskDeadline(pws)
+	return tb.mustMergeIntoInmemoryPart(bsrs, flushToDiskDeadline)
+}
+
+func (tb *Table) createInmemoryPart(ibs []*inmemoryBlock) *partWrapper {
 	// Prepare blockStreamReaders for source blocks.
 	bsrs := make([]*blockStreamReader, 0, len(ibs))
 	for _, ib := range ibs {
@@ -741,299 +984,453 @@ func (tb *Table) mergeInmemoryBlocks(ibs []*inmemoryBlock) *partWrapper {
 			continue
 		}
 		bsr := getBlockStreamReader()
-		bsr.InitFromInmemoryBlock(ib)
-		putInmemoryBlock(ib)
+		bsr.MustInitFromInmemoryBlock(ib)
 		bsrs = append(bsrs, bsr)
 	}
 	if len(bsrs) == 0 {
 		return nil
 	}
+
+	flushToDiskDeadline := time.Now().Add(dataFlushInterval)
 	if len(bsrs) == 1 {
 		// Nothing to merge. Just return a single inmemory part.
+		bsr := bsrs[0]
 		mp := &inmemoryPart{}
-		mp.Init(&bsrs[0].Block)
-		p := mp.NewPart()
-		return &partWrapper{
-			p:        p,
-			mp:       mp,
-			refCount: 1,
-		}
+		mp.Init(&bsr.Block)
+		putBlockStreamReader(bsr)
+		return newPartWrapperFromInmemoryPart(mp, flushToDiskDeadline)
 	}
 
+	return tb.mustMergeIntoInmemoryPart(bsrs, flushToDiskDeadline)
+}
+
+func (tb *Table) mustMergeIntoInmemoryPart(bsrs []*blockStreamReader, flushToDiskDeadline time.Time) *partWrapper {
 	// Prepare blockStreamWriter for destination part.
+	outItemsCount := uint64(0)
+	for _, bsr := range bsrs {
+		outItemsCount += bsr.ph.itemsCount
+	}
+	compressLevel := getCompressLevel(outItemsCount)
 	bsw := getBlockStreamWriter()
 	mpDst := &inmemoryPart{}
-	bsw.InitFromInmemoryPart(mpDst)
+	bsw.MustInitFromInmemoryPart(mpDst, compressLevel)
 
 	// Merge parts.
-	// The merge shouldn't be interrupted by stopCh,
-	// since it may be final after stopCh is closed.
-	err := mergeBlockStreams(&mpDst.ph, bsw, bsrs, tb.prepareBlock, nil, &tb.itemsMerged)
-	if err != nil {
-		logger.Panicf("FATAL: cannot merge inmemoryBlocks: %s", err)
-	}
+	// The merge shouldn't be interrupted by stopCh, so use nil stopCh.
+	ph, err := tb.mergePartsInternal("", bsw, bsrs, partInmemory, nil)
 	putBlockStreamWriter(bsw)
 	for _, bsr := range bsrs {
 		putBlockStreamReader(bsr)
 	}
-
-	p := mpDst.NewPart()
-	return &partWrapper{
-		p:        p,
-		mp:       mpDst,
-		refCount: 1,
+	if err != nil {
+		logger.Panicf("FATAL: cannot merge inmemoryBlocks: %s", err)
 	}
+	mpDst.ph = *ph
+
+	return newPartWrapperFromInmemoryPart(mpDst, flushToDiskDeadline)
 }
 
-func (tb *Table) startPartMergers() {
-	for i := 0; i < mergeWorkersCount; i++ {
-		tb.partMergersWG.Add(1)
-		go func() {
-			if err := tb.partMerger(); err != nil {
-				logger.Panicf("FATAL: unrecoverable error when merging parts in %q: %s", tb.path, err)
-			}
-			tb.partMergersWG.Done()
-		}()
+func newPartWrapperFromInmemoryPart(mp *inmemoryPart, flushToDiskDeadline time.Time) *partWrapper {
+	p := mp.NewPart()
+	pw := &partWrapper{
+		p:                   p,
+		mp:                  mp,
+		flushToDiskDeadline: flushToDiskDeadline,
 	}
+	pw.incRef()
+	return pw
 }
 
-func (tb *Table) canBackgroundMerge() bool {
-	return atomic.LoadUint32(tb.isReadOnly) == 0
+func getMaxInmemoryPartSize() uint64 {
+	// Allow up to 5% of memory for in-memory parts.
+	n := uint64(0.05 * float64(memory.Allowed()) / maxInmemoryParts)
+	if n < 1e6 {
+		n = 1e6
+	}
+	return n
 }
 
-var errReadOnlyMode = fmt.Errorf("storage is in readonly mode")
-
-func (tb *Table) mergeExistingParts(isFinal bool) error {
-	if !tb.canBackgroundMerge() {
-		// Do not perform background merge in read-only mode
-		// in order to prevent from disk space shortage.
-		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2603
-		return errReadOnlyMode
-	}
+func (tb *Table) getMaxFilePartSize() uint64 {
 	n := fs.MustGetFreeSpace(tb.path)
-	// Divide free space by the max number of concurrent merges.
-	maxOutBytes := n / uint64(mergeWorkersCount)
+	// Divide free space by the max number of concurrent merges for file parts.
+	maxOutBytes := n / uint64(cap(filePartsConcurrencyCh))
 	if maxOutBytes > maxPartSize {
 		maxOutBytes = maxPartSize
 	}
-
-	tb.partsLock.Lock()
-	pws := getPartsToMerge(tb.parts, maxOutBytes, isFinal)
-	tb.partsLock.Unlock()
-
-	return tb.mergeParts(pws, tb.stopCh, false)
+	return maxOutBytes
 }
 
-const (
-	minMergeSleepTime = time.Millisecond
-	maxMergeSleepTime = time.Second
-)
+// NotifyReadWriteMode notifies tb that it may be switched from read-only mode to read-write mode.
+func (tb *Table) NotifyReadWriteMode() {
+	tb.startInmemoryPartsMergers()
+	tb.startFilePartsMergers()
+}
 
-func (tb *Table) partMerger() error {
-	sleepTime := minMergeSleepTime
-	var lastMergeTime uint64
-	isFinal := false
-	t := time.NewTimer(sleepTime)
+func (tb *Table) inmemoryPartsMerger() {
 	for {
-		err := tb.mergeExistingParts(isFinal)
+		if tb.isReadOnly.Load() {
+			return
+		}
+		maxOutBytes := tb.getMaxFilePartSize()
+
+		tb.partsLock.Lock()
+		pws := getPartsToMerge(tb.inmemoryParts, maxOutBytes)
+		tb.partsLock.Unlock()
+
+		if len(pws) == 0 {
+			// Nothing to merge
+			return
+		}
+
+		inmemoryPartsConcurrencyCh <- struct{}{}
+		err := tb.mergeParts(pws, tb.stopCh, false)
+		<-inmemoryPartsConcurrencyCh
+
 		if err == nil {
 			// Try merging additional parts.
-			sleepTime = minMergeSleepTime
-			lastMergeTime = fasttime.UnixTimestamp()
-			isFinal = false
+			continue
+		}
+		if errors.Is(err, errForciblyStopped) {
+			// Nothing to do - finish the merger.
+			return
+		}
+		// Unexpected error.
+		logger.Panicf("FATAL: unrecoverable error when merging inmemory parts in %q: %s", tb.path, err)
+	}
+}
+
+func (tb *Table) filePartsMerger() {
+	for {
+		if tb.isReadOnly.Load() {
+			return
+		}
+		maxOutBytes := tb.getMaxFilePartSize()
+
+		tb.partsLock.Lock()
+		pws := getPartsToMerge(tb.fileParts, maxOutBytes)
+		tb.partsLock.Unlock()
+
+		if len(pws) == 0 {
+			// Nothing to merge
+			return
+		}
+
+		filePartsConcurrencyCh <- struct{}{}
+		err := tb.mergeParts(pws, tb.stopCh, false)
+		<-filePartsConcurrencyCh
+
+		if err == nil {
+			// Try merging additional parts.
 			continue
 		}
 		if errors.Is(err, errForciblyStopped) {
 			// The merger has been stopped.
-			return nil
+			return
 		}
-		if !errors.Is(err, errNothingToMerge) && !errors.Is(err, errReadOnlyMode) {
-			return err
-		}
-		if fasttime.UnixTimestamp()-lastMergeTime > 30 {
-			// We have free time for merging into bigger parts.
-			// This should improve select performance.
-			lastMergeTime = fasttime.UnixTimestamp()
-			isFinal = true
-			continue
-		}
+		// Unexpected error.
+		logger.Panicf("FATAL: unrecoverable error when merging file parts in %q: %s", tb.path, err)
+	}
+}
 
-		// Nothing to merge. Sleep for a while and try again.
-		sleepTime *= 2
-		if sleepTime > maxMergeSleepTime {
-			sleepTime = maxMergeSleepTime
-		}
-		select {
-		case <-tb.stopCh:
-			return nil
-		case <-t.C:
-			t.Reset(sleepTime)
+func assertIsInMerge(pws []*partWrapper) {
+	for _, pw := range pws {
+		if !pw.isInMerge {
+			logger.Panicf("BUG: partWrapper.isInMerge unexpectedly set to false")
 		}
 	}
 }
 
-var errNothingToMerge = fmt.Errorf("nothing to merge")
+func (tb *Table) releasePartsToMerge(pws []*partWrapper) {
+	tb.partsLock.Lock()
+	for _, pw := range pws {
+		if !pw.isInMerge {
+			logger.Panicf("BUG: missing isInMerge flag on the part %q", pw.p.path)
+		}
+		pw.isInMerge = false
+	}
+	tb.partsLock.Unlock()
+}
 
-// mergeParts merges pws.
+// mergeParts merges pws to a single resulting part.
+//
+// It is expected that pws contains at least a single part.
 //
 // Merging is immediately stopped if stopCh is closed.
 //
+// If isFinal is set, then the resulting part will be stored to disk.
+// If at least a single source part at pws is stored on disk, then the resulting part
+// will be stored to disk.
+//
 // All the parts inside pws must have isInMerge field set to true.
-func (tb *Table) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isOuterParts bool) error {
+// The isInMerge field inside pws parts is set to false before returning from the function.
+func (tb *Table) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFinal bool) error {
 	if len(pws) == 0 {
-		// Nothing to merge.
-		return errNothingToMerge
+		logger.Panicf("BUG: empty pws cannot be passed to mergeParts()")
 	}
 
-	atomic.AddUint64(&tb.mergesCount, 1)
-	atomic.AddUint64(&tb.activeMerges, 1)
-	defer atomic.AddUint64(&tb.activeMerges, ^uint64(0))
+	assertIsInMerge(pws)
+	defer tb.releasePartsToMerge(pws)
 
 	startTime := time.Now()
 
-	defer func() {
-		// Remove isInMerge flag from pws.
-		tb.partsLock.Lock()
-		for _, pw := range pws {
-			if !pw.isInMerge {
-				logger.Panicf("BUG: missing isInMerge flag on the part %q", pw.p.path)
-			}
-			pw.isInMerge = false
-		}
-		tb.partsLock.Unlock()
-	}()
-
-	// Prepare blockStreamReaders for source parts.
-	bsrs := make([]*blockStreamReader, 0, len(pws))
-	defer func() {
-		for _, bsr := range bsrs {
-			putBlockStreamReader(bsr)
-		}
-	}()
-	for _, pw := range pws {
-		bsr := getBlockStreamReader()
-		if pw.mp != nil {
-			if !isOuterParts {
-				logger.Panicf("BUG: inmemory part must be always outer")
-			}
-			bsr.InitFromInmemoryPart(pw.mp)
-		} else {
-			if err := bsr.InitFromFilePart(pw.p.path); err != nil {
-				return fmt.Errorf("cannot open source part for merging: %w", err)
-			}
-		}
-		bsrs = append(bsrs, bsr)
-	}
-
-	outItemsCount := uint64(0)
-	outBlocksCount := uint64(0)
-	for _, pw := range pws {
-		outItemsCount += pw.p.ph.itemsCount
-		outBlocksCount += pw.p.ph.blocksCount
-	}
-	nocache := true
-	if outItemsCount < maxItemsPerCachedPart() {
-		// Cache small (i.e. recent) output parts in OS file cache,
-		// since there is high chance they will be read soon.
-		nocache = false
-	}
-
-	// Prepare blockStreamWriter for destination part.
+	// Initialize destination paths.
+	dstPartType := getDstPartType(pws, isFinal)
 	mergeIdx := tb.nextMergeIdx()
-	tmpPartPath := fmt.Sprintf("%s/tmp/%016X", tb.path, mergeIdx)
+	dstPartPath := ""
+	if dstPartType == partFile {
+		dstPartPath = filepath.Join(tb.path, fmt.Sprintf("%016X", mergeIdx))
+	}
+
+	if isFinal && len(pws) == 1 && pws[0].mp != nil {
+		// Fast path: flush a single in-memory part to disk.
+		mp := pws[0].mp
+		mp.MustStoreToDisk(dstPartPath)
+		pwNew := tb.openCreatedPart(pws, nil, dstPartPath)
+		tb.swapSrcWithDstParts(pws, pwNew, dstPartType)
+		return nil
+	}
+
+	// Prepare BlockStreamReaders for source parts.
+	bsrs := mustOpenBlockStreamReaders(pws)
+
+	// Prepare BlockStreamWriter for destination part.
+	srcSize := uint64(0)
+	srcItemsCount := uint64(0)
+	srcBlocksCount := uint64(0)
+	for _, pw := range pws {
+		srcSize += pw.p.size
+		srcItemsCount += pw.p.ph.itemsCount
+		srcBlocksCount += pw.p.ph.blocksCount
+	}
+	compressLevel := getCompressLevel(srcItemsCount)
 	bsw := getBlockStreamWriter()
-	compressLevel := getCompressLevelForPartItems(outItemsCount, outBlocksCount)
-	if err := bsw.InitFromFilePart(tmpPartPath, nocache, compressLevel); err != nil {
-		return fmt.Errorf("cannot create destination part %q: %w", tmpPartPath, err)
+	var mpNew *inmemoryPart
+	if dstPartType == partInmemory {
+		mpNew = &inmemoryPart{}
+		bsw.MustInitFromInmemoryPart(mpNew, compressLevel)
+	} else {
+		nocache := srcItemsCount > maxItemsPerCachedPart()
+		bsw.MustInitFromFilePart(dstPartPath, nocache, compressLevel)
 	}
 
-	// Merge parts into a temporary location.
-	var ph partHeader
-	err := mergeBlockStreams(&ph, bsw, bsrs, tb.prepareBlock, stopCh, &tb.itemsMerged)
+	// Merge source parts to destination part.
+	ph, err := tb.mergePartsInternal(dstPartPath, bsw, bsrs, dstPartType, stopCh)
 	putBlockStreamWriter(bsw)
-	if err != nil {
-		return fmt.Errorf("error when merging parts to %q: %w", tmpPartPath, err)
-	}
-	if err := ph.WriteMetadata(tmpPartPath); err != nil {
-		return fmt.Errorf("cannot write metadata to destination part %q: %w", tmpPartPath, err)
-	}
-
-	// Close bsrs (aka source parts).
 	for _, bsr := range bsrs {
 		putBlockStreamReader(bsr)
 	}
-	bsrs = nil
-
-	// Create a transaction for atomic deleting old parts and moving
-	// new part to its destination place.
-	var bb bytesutil.ByteBuffer
-	for _, pw := range pws {
-		if pw.mp == nil {
-			fmt.Fprintf(&bb, "%s\n", pw.p.path)
-		}
-	}
-	dstPartPath := ph.Path(tb.path, mergeIdx)
-	fmt.Fprintf(&bb, "%s -> %s\n", tmpPartPath, dstPartPath)
-	txnPath := fmt.Sprintf("%s/txn/%016X", tb.path, mergeIdx)
-	if err := fs.WriteFileAtomically(txnPath, bb.B, false); err != nil {
-		return fmt.Errorf("cannot create transaction file %q: %w", txnPath, err)
-	}
-
-	// Run the created transaction.
-	if err := runTransaction(&tb.snapshotLock, tb.path, txnPath); err != nil {
-		return fmt.Errorf("cannot execute transaction %q: %w", txnPath, err)
-	}
-
-	// Open the merged part.
-	newP, err := openFilePart(dstPartPath)
 	if err != nil {
-		return fmt.Errorf("cannot open merged part %q: %w", dstPartPath, err)
+		return err
 	}
-	newPSize := newP.size
-	newPW := &partWrapper{
-		p:        newP,
-		refCount: 1,
-	}
-
-	// Atomically remove old parts and add new part.
-	m := make(map[*partWrapper]bool, len(pws))
-	for _, pw := range pws {
-		m[pw] = true
-	}
-	if len(m) != len(pws) {
-		logger.Panicf("BUG: %d duplicate parts found in the merge of %d parts", len(pws)-len(m), len(pws))
-	}
-	removedParts := 0
-	tb.partsLock.Lock()
-	tb.parts, removedParts = removeParts(tb.parts, m)
-	tb.parts = append(tb.parts, newPW)
-	tb.partsLock.Unlock()
-	if removedParts != len(m) {
-		if !isOuterParts {
-			logger.Panicf("BUG: unexpected number of parts removed; got %d; want %d", removedParts, len(m))
-		}
-		if removedParts != 0 {
-			logger.Panicf("BUG: removed non-zero outer parts: %d", removedParts)
-		}
+	if mpNew != nil {
+		// Update partHeader for destination inmemory part after the merge.
+		mpNew.ph = *ph
+	} else {
+		// Make sure the created part directory listing is synced.
+		fs.MustSyncPath(dstPartPath)
 	}
 
-	// Remove partition references from old parts.
-	for _, pw := range pws {
-		pw.decRef()
-	}
+	// Atomically swap the source parts with the newly created part.
+	pwNew := tb.openCreatedPart(pws, mpNew, dstPartPath)
+	pDst := pwNew.p
+	dstItemsCount := pDst.ph.itemsCount
+	dstBlocksCount := pDst.ph.blocksCount
+	dstSize := pDst.size
+
+	tb.swapSrcWithDstParts(pws, pwNew, dstPartType)
 
 	d := time.Since(startTime)
-	if d > 30*time.Second {
-		logger.Infof("merged %d items across %d blocks in %.3f seconds at %d items/sec to %q; sizeBytes: %d",
-			outItemsCount, outBlocksCount, d.Seconds(), int(float64(outItemsCount)/d.Seconds()), dstPartPath, newPSize)
+	if d <= 30*time.Second {
+		return nil
 	}
+
+	// Log stats for long merges.
+	durationSecs := d.Seconds()
+	itemsPerSec := int(float64(srcItemsCount) / durationSecs)
+	logger.Infof("merged (%d parts, %d items, %d blocks, %d bytes) into (1 part, %d items, %d blocks, %d bytes) in %.3f seconds at %d items/sec to %q",
+		len(pws), srcItemsCount, srcBlocksCount, srcSize, dstItemsCount, dstBlocksCount, dstSize, durationSecs, itemsPerSec, dstPartPath)
 
 	return nil
 }
 
-func getCompressLevelForPartItems(itemsCount, blocksCount uint64) int {
-	// There is no need in using blocksCount here, since mergeset blocks are usually full.
+func getFlushToDiskDeadline(pws []*partWrapper) time.Time {
+	d := time.Now().Add(dataFlushInterval)
+	for _, pw := range pws {
+		if pw.mp != nil && pw.flushToDiskDeadline.Before(d) {
+			d = pw.flushToDiskDeadline
+		}
+	}
+	return d
+}
 
+type partType int
+
+var (
+	partInmemory = partType(0)
+	partFile     = partType(1)
+)
+
+func getDstPartType(pws []*partWrapper, isFinal bool) partType {
+	dstPartSize := getPartsSize(pws)
+	if isFinal || dstPartSize > getMaxInmemoryPartSize() {
+		return partFile
+	}
+	if !areAllInmemoryParts(pws) {
+		// If at least a single source part is located in file,
+		// then the destination part must be in file for durability reasons.
+		return partFile
+	}
+	return partInmemory
+}
+
+func mustOpenBlockStreamReaders(pws []*partWrapper) []*blockStreamReader {
+	bsrs := make([]*blockStreamReader, 0, len(pws))
+	for _, pw := range pws {
+		bsr := getBlockStreamReader()
+		if pw.mp != nil {
+			bsr.MustInitFromInmemoryPart(pw.mp)
+		} else {
+			bsr.MustInitFromFilePart(pw.p.path)
+		}
+		bsrs = append(bsrs, bsr)
+	}
+	return bsrs
+}
+
+func (tb *Table) mergePartsInternal(dstPartPath string, bsw *blockStreamWriter, bsrs []*blockStreamReader, dstPartType partType, stopCh <-chan struct{}) (*partHeader, error) {
+	var ph partHeader
+	var itemsMerged *atomic.Uint64
+	var mergesCount *atomic.Uint64
+	var activeMerges *atomic.Int64
+	switch dstPartType {
+	case partInmemory:
+		itemsMerged = &tb.inmemoryItemsMerged
+		mergesCount = &tb.inmemoryMergesCount
+		activeMerges = &tb.activeInmemoryMerges
+	case partFile:
+		itemsMerged = &tb.fileItemsMerged
+		mergesCount = &tb.fileMergesCount
+		activeMerges = &tb.activeFileMerges
+	default:
+		logger.Panicf("BUG: unknown partType=%d", dstPartType)
+	}
+	activeMerges.Add(1)
+	err := mergeBlockStreams(&ph, bsw, bsrs, tb.prepareBlock, stopCh, itemsMerged)
+	activeMerges.Add(-1)
+	mergesCount.Add(1)
+	if err != nil {
+		return nil, fmt.Errorf("cannot merge %d parts to %s: %w", len(bsrs), dstPartPath, err)
+	}
+	if dstPartPath != "" {
+		ph.MustWriteMetadata(dstPartPath)
+	}
+	return &ph, nil
+}
+
+func (tb *Table) openCreatedPart(pws []*partWrapper, mpNew *inmemoryPart, dstPartPath string) *partWrapper {
+	// Open the created part.
+	if mpNew != nil {
+		// Open the created part from memory.
+		flushToDiskDeadline := getFlushToDiskDeadline(pws)
+		pwNew := newPartWrapperFromInmemoryPart(mpNew, flushToDiskDeadline)
+		return pwNew
+	}
+	// Open the created part from disk.
+	pNew := mustOpenFilePart(dstPartPath)
+	pwNew := &partWrapper{
+		p: pNew,
+	}
+	pwNew.incRef()
+	return pwNew
+}
+
+func areAllInmemoryParts(pws []*partWrapper) bool {
+	for _, pw := range pws {
+		if pw.mp == nil {
+			return false
+		}
+	}
+	return true
+}
+
+func (tb *Table) swapSrcWithDstParts(pws []*partWrapper, pwNew *partWrapper, dstPartType partType) {
+	// Atomically unregister old parts and add new part to tb.
+	m := makeMapFromPartWrappers(pws)
+
+	removedInmemoryParts := 0
+	removedFileParts := 0
+
+	tb.partsLock.Lock()
+
+	tb.inmemoryParts, removedInmemoryParts = removeParts(tb.inmemoryParts, m)
+	tb.fileParts, removedFileParts = removeParts(tb.fileParts, m)
+	switch dstPartType {
+	case partInmemory:
+		tb.inmemoryParts = append(tb.inmemoryParts, pwNew)
+		tb.startInmemoryPartsMergerLocked()
+	case partFile:
+		tb.fileParts = append(tb.fileParts, pwNew)
+		tb.startFilePartsMergerLocked()
+	default:
+		logger.Panicf("BUG: unknown partType=%d", dstPartType)
+	}
+
+	// Atomically store the updated list of file-based parts on disk.
+	// This must be performed under partsLock in order to prevent from races
+	// when multiple concurrently running goroutines update the list.
+	if removedFileParts > 0 || dstPartType == partFile {
+		mustWritePartNames(tb.fileParts, tb.path)
+	}
+
+	tb.partsLock.Unlock()
+
+	// Update inmemoryPartsLimitCh accordingly to the number of the remaining in-memory parts.
+	for i := 0; i < removedInmemoryParts; i++ {
+		select {
+		case <-tb.inmemoryPartsLimitCh:
+		case <-tb.stopCh:
+		}
+	}
+	if dstPartType == partInmemory {
+		select {
+		case tb.inmemoryPartsLimitCh <- struct{}{}:
+		case <-tb.stopCh:
+		}
+	}
+
+	removedParts := removedInmemoryParts + removedFileParts
+	if removedParts != len(m) {
+		logger.Panicf("BUG: unexpected number of parts removed; got %d, want %d", removedParts, len(m))
+	}
+
+	// Mark old parts as must be deleted and decrement reference count,
+	// so they are eventually closed and deleted.
+	for _, pw := range pws {
+		pw.mustDrop.Store(true)
+		pw.decRef()
+	}
+}
+
+func makeMapFromPartWrappers(pws []*partWrapper) map[*partWrapper]struct{} {
+	m := make(map[*partWrapper]struct{}, len(pws))
+	for _, pw := range pws {
+		m[pw] = struct{}{}
+	}
+	if len(m) != len(pws) {
+		logger.Panicf("BUG: %d duplicate parts found in %d source parts", len(pws)-len(m), len(pws))
+	}
+	return m
+}
+
+func getPartsSize(pws []*partWrapper) uint64 {
+	n := uint64(0)
+	for _, pw := range pws {
+		n += pw.p.size
+	}
+	return n
+}
+
+func getCompressLevel(itemsCount uint64) int {
 	if itemsCount <= 1<<16 {
 		// -5 is the minimum supported compression for zstd.
 		// See https://github.com/facebook/zstd/releases/tag/v1.3.4
@@ -1057,102 +1454,84 @@ func getCompressLevelForPartItems(itemsCount, blocksCount uint64) int {
 	if itemsCount <= 1<<25 {
 		return 2
 	}
-	if itemsCount <= 1<<28 {
-		return 3
-	}
-	return 4
+	return 3
 }
 
 func (tb *Table) nextMergeIdx() uint64 {
-	return atomic.AddUint64(&tb.mergeIdx, 1)
+	return tb.mergeIdx.Add(1)
 }
 
-var mergeWorkersCount = cgroup.AvailableCPUs()
-
-func openParts(path string) ([]*partWrapper, error) {
+func mustOpenParts(path string) []*partWrapper {
 	// The path can be missing after restoring from backup, so create it if needed.
-	if err := fs.MkdirAllIfNotExist(path); err != nil {
-		return nil, err
-	}
+	fs.MustMkdirIfNotExist(path)
 	fs.MustRemoveTemporaryDirs(path)
-	d, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open difrectory: %w", err)
-	}
-	defer fs.MustClose(d)
 
-	// Run remaining transactions and cleanup /txn and /tmp directories.
-	// Snapshots cannot be created yet, so use fakeSnapshotLock.
-	var fakeSnapshotLock sync.RWMutex
-	if err := runTransactions(&fakeSnapshotLock, path); err != nil {
-		return nil, fmt.Errorf("cannot run transactions: %w", err)
-	}
+	// Remove txn and tmp directories, which may be left after the upgrade
+	// to v1.90.0 and newer versions.
+	fs.MustRemoveAll(filepath.Join(path, "txn"))
+	fs.MustRemoveAll(filepath.Join(path, "tmp"))
 
-	txnDir := path + "/txn"
-	fs.MustRemoveDirAtomic(txnDir)
-	if err := fs.MkdirAllFailIfExist(txnDir); err != nil {
-		return nil, fmt.Errorf("cannot create %q: %w", txnDir, err)
-	}
+	partNames := mustReadPartNames(path)
 
-	tmpDir := path + "/tmp"
-	fs.MustRemoveDirAtomic(tmpDir)
-	if err := fs.MkdirAllFailIfExist(tmpDir); err != nil {
-		return nil, fmt.Errorf("cannot create %q: %w", tmpDir, err)
-	}
+	// Remove dirs missing in partNames. These dirs may be left after unclean shutdown
+	// or after the update from versions prior to v1.90.0.
+	des := fs.MustReadDir(path)
+	m := make(map[string]struct{}, len(partNames))
+	for _, partName := range partNames {
+		// Make sure the partName exists on disk.
+		// If it is missing, then manual action from the user is needed,
+		// since this is unexpected state, which cannot occur under normal operation,
+		// including unclean shutdown.
+		partPath := filepath.Join(path, partName)
+		if !fs.IsPathExist(partPath) {
+			partsFile := filepath.Join(path, partsFilename)
+			logger.Panicf("FATAL: part %q is listed in %q, but is missing on disk; "+
+				"ensure %q contents is not corrupted; remove %q to rebuild its' content from the list of existing parts",
+				partPath, partsFile, partsFile, partsFile)
+		}
 
-	fs.MustSyncPath(path)
-
-	// Open parts.
-	fis, err := d.Readdir(-1)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read directory: %w", err)
+		m[partName] = struct{}{}
 	}
-	var pws []*partWrapper
-	for _, fi := range fis {
-		if !fs.IsDirOrSymlink(fi) {
+	for _, de := range des {
+		if !fs.IsDirOrSymlink(de) {
 			// Skip non-directories.
 			continue
 		}
-		fn := fi.Name()
-		if isSpecialDir(fn) {
-			// Skip special dirs.
-			continue
+		fn := de.Name()
+		if _, ok := m[fn]; !ok {
+			deletePath := filepath.Join(path, fn)
+			fs.MustRemoveAll(deletePath)
 		}
-		partPath := path + "/" + fn
-		if fs.IsEmptyDir(partPath) {
-			// Remove empty directory, which can be left after unclean shutdown on NFS.
-			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1142
-			fs.MustRemoveDirAtomic(partPath)
-			continue
-		}
-		p, err := openFilePart(partPath)
-		if err != nil {
-			mustCloseParts(pws)
-			return nil, fmt.Errorf("cannot open part %q: %w", partPath, err)
-		}
+	}
+	fs.MustSyncPath(path)
+
+	// Open parts
+	var pws []*partWrapper
+	for _, partName := range partNames {
+		partPath := filepath.Join(path, partName)
+		p := mustOpenFilePart(partPath)
 		pw := &partWrapper{
-			p:        p,
-			refCount: 1,
+			p: p,
 		}
+		pw.incRef()
 		pws = append(pws, pw)
 	}
-
-	return pws, nil
-}
-
-func mustCloseParts(pws []*partWrapper) {
-	for _, pw := range pws {
-		if pw.refCount != 1 {
-			logger.Panicf("BUG: unexpected refCount when closing part %q: %d; want 1", pw.p.path, pw.refCount)
-		}
-		pw.p.MustClose()
+	partNamesPath := filepath.Join(path, partsFilename)
+	if !fs.IsPathExist(partNamesPath) {
+		// Create parts.json file if it doesn't exist yet.
+		// This should protect from possible carshloops just after the migration from versions below v1.90.0
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4336
+		mustWritePartNames(pws, path)
 	}
+
+	return pws
 }
 
 // CreateSnapshotAt creates tb snapshot in the given dstDir.
 //
-// Snapshot is created using linux hard links, so it is usually created
-// very quickly.
+// Snapshot is created using linux hard links, so it is usually created very quickly.
+//
+// The caller is responsible for data removal at dstDir on unsuccessful snapshot creation.
 func (tb *Table) CreateSnapshotAt(dstDir string) error {
 	logger.Infof("creating Table snapshot of %q...", tb.path)
 	startTime := time.Now()
@@ -1167,56 +1546,30 @@ func (tb *Table) CreateSnapshotAt(dstDir string) error {
 	if err != nil {
 		return fmt.Errorf("cannot obtain absolute dir for %q: %w", dstDir, err)
 	}
-	if strings.HasPrefix(dstDir, srcDir+"/") {
+	if strings.HasPrefix(dstDir, srcDir+string(filepath.Separator)) {
 		return fmt.Errorf("cannot create snapshot %q inside the data dir %q", dstDir, srcDir)
 	}
 
 	// Flush inmemory items to disk.
-	tb.flushRawItems(true)
+	tb.flushInmemoryItemsToFiles()
 
-	// The snapshot must be created under the lock in order to prevent from
-	// concurrent modifications via runTransaction.
-	tb.snapshotLock.Lock()
-	defer tb.snapshotLock.Unlock()
+	fs.MustMkdirFailIfExist(dstDir)
 
-	if err := fs.MkdirAllFailIfExist(dstDir); err != nil {
-		return fmt.Errorf("cannot create snapshot dir %q: %w", dstDir, err)
-	}
+	pws := tb.getParts(nil)
+	defer tb.putParts(pws)
 
-	d, err := os.Open(srcDir)
-	if err != nil {
-		return fmt.Errorf("cannot open difrectory: %w", err)
-	}
-	defer fs.MustClose(d)
+	// Create a file with part names at dstDir
+	mustWritePartNames(pws, dstDir)
 
-	fis, err := d.Readdir(-1)
-	if err != nil {
-		return fmt.Errorf("cannot read directory: %w", err)
-	}
-	for _, fi := range fis {
-		fn := fi.Name()
-		if !fs.IsDirOrSymlink(fi) {
-			switch fn {
-			case convertToV1280FileName:
-				srcPath := srcDir + "/" + fn
-				dstPath := dstDir + "/" + fn
-				if err := os.Link(srcPath, dstPath); err != nil {
-					return fmt.Errorf("cannot hard link from %q to %q: %w", srcPath, dstPath, err)
-				}
-			default:
-				// Skip other non-directories.
-			}
+	// Make hardlinks for pws at dstDir
+	for _, pw := range pws {
+		if pw.mp != nil {
+			// Skip in-memory parts
 			continue
 		}
-		if isSpecialDir(fn) {
-			// Skip special dirs.
-			continue
-		}
-		srcPartPath := srcDir + "/" + fn
-		dstPartPath := dstDir + "/" + fn
-		if err := fs.HardLinkFiles(srcPartPath, dstPartPath); err != nil {
-			return fmt.Errorf("cannot create hard links from %q to %q: %w", srcPartPath, dstPartPath, err)
-		}
+		srcPartPath := pw.p.path
+		dstPartPath := filepath.Join(dstDir, filepath.Base(srcPartPath))
+		fs.MustHardLinkFiles(srcPartPath, dstPartPath)
 	}
 
 	fs.MustSyncPath(dstDir)
@@ -1227,166 +1580,103 @@ func (tb *Table) CreateSnapshotAt(dstDir string) error {
 	return nil
 }
 
-func runTransactions(txnLock *sync.RWMutex, path string) error {
-	// Wait until all the previous pending transaction deletions are finished.
-	pendingTxnDeletionsWG.Wait()
-
-	// Make sure all the current transaction deletions are finished before exiting.
-	defer pendingTxnDeletionsWG.Wait()
-
-	txnDir := path + "/txn"
-	d, err := os.Open(txnDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("cannot open %q: %w", txnDir, err)
-	}
-	defer fs.MustClose(d)
-
-	fis, err := d.Readdir(-1)
-	if err != nil {
-		return fmt.Errorf("cannot read directory %q: %w", d.Name(), err)
-	}
-
-	// Sort transaction files by id, since transactions must be ordered.
-	sort.Slice(fis, func(i, j int) bool {
-		return fis[i].Name() < fis[j].Name()
-	})
-
-	for _, fi := range fis {
-		fn := fi.Name()
-		if fs.IsTemporaryFileName(fn) {
-			// Skip temporary files, which could be left after unclean shutdown.
+func mustWritePartNames(pws []*partWrapper, dstDir string) {
+	partNames := make([]string, 0, len(pws))
+	for _, pw := range pws {
+		if pw.mp != nil {
+			// Skip in-memory parts
 			continue
 		}
-		txnPath := txnDir + "/" + fn
-		if err := runTransaction(txnLock, path, txnPath); err != nil {
-			return fmt.Errorf("cannot run transaction from %q: %w", txnPath, err)
-		}
+		partName := filepath.Base(pw.p.path)
+		partNames = append(partNames, partName)
 	}
-	return nil
+	sort.Strings(partNames)
+	data, err := json.Marshal(partNames)
+	if err != nil {
+		logger.Panicf("BUG: cannot marshal partNames to JSON: %s", err)
+	}
+	partNamesPath := filepath.Join(dstDir, partsFilename)
+	fs.MustWriteAtomic(partNamesPath, data, true)
 }
 
-func runTransaction(txnLock *sync.RWMutex, pathPrefix, txnPath string) error {
-	// The transaction must run under read lock in order to provide
-	// consistent snapshots with Table.CreateSnapshot().
-	txnLock.RLock()
-	defer txnLock.RUnlock()
-
-	data, err := os.ReadFile(txnPath)
-	if err != nil {
-		return fmt.Errorf("cannot read transaction file: %w", err)
-	}
-	if len(data) > 0 && data[len(data)-1] == '\n' {
-		data = data[:len(data)-1]
-	}
-	paths := strings.Split(string(data), "\n")
-
-	if len(paths) == 0 {
-		return fmt.Errorf("empty transaction")
-	}
-	rmPaths := paths[:len(paths)-1]
-	mvPaths := strings.Split(paths[len(paths)-1], " -> ")
-	if len(mvPaths) != 2 {
-		return fmt.Errorf("invalid last line in the transaction file: got %q; must contain `srcPath -> dstPath`", paths[len(paths)-1])
-	}
-
-	// Remove old paths. It is OK if certain paths don't exist.
-	for _, path := range rmPaths {
-		path, err := validatePath(pathPrefix, path)
+func mustReadPartNames(srcDir string) []string {
+	partNamesPath := filepath.Join(srcDir, partsFilename)
+	if fs.IsPathExist(partNamesPath) {
+		data, err := os.ReadFile(partNamesPath)
 		if err != nil {
-			return fmt.Errorf("invalid path to remove: %w", err)
+			logger.Panicf("FATAL: cannot read %s file: %s", partsFilename, err)
 		}
-		fs.MustRemoveDirAtomic(path)
-	}
-
-	// Move the new part to new directory.
-	srcPath := mvPaths[0]
-	dstPath := mvPaths[1]
-	srcPath, err = validatePath(pathPrefix, srcPath)
-	if err != nil {
-		return fmt.Errorf("invalid source path to rename: %w", err)
-	}
-	dstPath, err = validatePath(pathPrefix, dstPath)
-	if err != nil {
-		return fmt.Errorf("invalid destination path to rename: %w", err)
-	}
-	if fs.IsPathExist(srcPath) {
-		if err := os.Rename(srcPath, dstPath); err != nil {
-			return fmt.Errorf("cannot rename %q to %q: %w", srcPath, dstPath, err)
+		var partNames []string
+		if err := json.Unmarshal(data, &partNames); err != nil {
+			logger.Panicf("FATAL: cannot parse %s: %s", partNamesPath, err)
 		}
-	} else if !fs.IsPathExist(dstPath) {
-		// Emit info message for the expected condition after unclean shutdown on NFS disk.
-		// The dstPath part may be missing because it could be already merged into bigger part
-		// while old source parts for the current txn weren't still deleted due to NFS locks.
-		logger.Infof("cannot find both source and destination paths: %q -> %q; this may be the case after unclean shutdown (OOM, `kill -9`, hard reset) on NFS disk",
-			srcPath, dstPath)
+		return partNames
 	}
-
-	// Flush pathPrefix directory metadata to the underying storage.
-	fs.MustSyncPath(pathPrefix)
-
-	pendingTxnDeletionsWG.Add(1)
-	go func() {
-		defer pendingTxnDeletionsWG.Done()
-		if err := os.Remove(txnPath); err != nil {
-			logger.Errorf("cannot remove transaction file %q: %s", txnPath, err)
+	// The partsFilename is missing. This is the upgrade from versions previous to v1.90.0.
+	// Read part names from directories under srcDir
+	des := fs.MustReadDir(srcDir)
+	var partNames []string
+	for _, de := range des {
+		if !fs.IsDirOrSymlink(de) {
+			// Skip non-directories.
+			continue
 		}
-	}()
-
-	return nil
-}
-
-var pendingTxnDeletionsWG syncwg.WaitGroup
-
-func validatePath(pathPrefix, path string) (string, error) {
-	var err error
-
-	pathPrefix, err = filepath.Abs(pathPrefix)
-	if err != nil {
-		return path, fmt.Errorf("cannot determine absolute path for pathPrefix=%q: %w", pathPrefix, err)
+		partName := de.Name()
+		if isSpecialDir(partName) {
+			// Skip special dirs.
+			continue
+		}
+		partNames = append(partNames, partName)
 	}
-
-	path, err = filepath.Abs(path)
-	if err != nil {
-		return path, fmt.Errorf("cannot determine absolute path for %q: %w", path, err)
-	}
-	if !strings.HasPrefix(path, pathPrefix+"/") {
-		return path, fmt.Errorf("invalid path %q; must start with %q", path, pathPrefix+"/")
-	}
-	return path, nil
+	return partNames
 }
 
 // getPartsToMerge returns optimal parts to merge from pws.
 //
-// if isFinal is set, then merge harder.
-//
 // The summary size of the returned parts must be smaller than the maxOutBytes.
-func getPartsToMerge(pws []*partWrapper, maxOutBytes uint64, isFinal bool) []*partWrapper {
+func getPartsToMerge(pws []*partWrapper, maxOutBytes uint64) []*partWrapper {
 	pwsRemaining := make([]*partWrapper, 0, len(pws))
 	for _, pw := range pws {
 		if !pw.isInMerge {
 			pwsRemaining = append(pwsRemaining, pw)
 		}
 	}
-	maxPartsToMerge := defaultPartsToMerge
-	var dst []*partWrapper
-	if isFinal {
-		for len(dst) == 0 && maxPartsToMerge >= finalPartsToMerge {
-			dst = appendPartsToMerge(dst[:0], pwsRemaining, maxPartsToMerge, maxOutBytes)
-			maxPartsToMerge--
-		}
-	} else {
-		dst = appendPartsToMerge(dst[:0], pwsRemaining, maxPartsToMerge, maxOutBytes)
-	}
-	for _, pw := range dst {
+
+	pwsToMerge := appendPartsToMerge(nil, pwsRemaining, defaultPartsToMerge, maxOutBytes)
+
+	for _, pw := range pwsToMerge {
 		if pw.isInMerge {
-			logger.Panicf("BUG: partWrapper.isInMerge is already set")
+			logger.Panicf("BUG: partWrapper.isInMerge unexpectedly set to true")
 		}
 		pw.isInMerge = true
 	}
-	return dst
+
+	return pwsToMerge
+}
+
+// getPartsForOptimalMerge returns parts from pws for optimal merge, plus the remaining parts.
+//
+// the pws items are replaced by nil after the call. This is needed for helping Go GC to reclaim the referenced items.
+func getPartsForOptimalMerge(pws []*partWrapper) ([]*partWrapper, []*partWrapper) {
+	pwsToMerge := appendPartsToMerge(nil, pws, defaultPartsToMerge, math.MaxUint64)
+	if len(pwsToMerge) == 0 {
+		return pws, nil
+	}
+
+	m := makeMapFromPartWrappers(pwsToMerge)
+	pwsRemaining := make([]*partWrapper, 0, len(pws)-len(pwsToMerge))
+	for _, pw := range pws {
+		if _, ok := m[pw]; !ok {
+			pwsRemaining = append(pwsRemaining, pw)
+		}
+	}
+
+	// Clear references to pws items, so they could be reclaimed faster by Go GC.
+	for i := range pws {
+		pws[i] = nil
+	}
+
+	return pwsToMerge, pwsRemaining
 }
 
 // minMergeMultiplier is the minimum multiplier for the size of the output part
@@ -1397,8 +1687,7 @@ func getPartsToMerge(pws []*partWrapper, maxOutBytes uint64, isFinal bool) []*pa
 // The 1.7 is good enough for production workloads.
 const minMergeMultiplier = 1.7
 
-// appendPartsToMerge finds optimal parts to merge from src, appends
-// them to dst and returns the result.
+// appendPartsToMerge finds optimal parts to merge from src, appends them to dst and returns the result.
 func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxOutBytes uint64) []*partWrapper {
 	if len(src) < 2 {
 		// There is no need in merging zero or one part :)
@@ -1420,8 +1709,7 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxOutByte
 	}
 	src = tmp
 
-	// Sort src parts by size.
-	sort.Slice(src, func(i, j int) bool { return src[i].p.size < src[j].p.size })
+	sortPartsForOptimalMerge(src)
 
 	maxSrcParts := maxPartsToMerge
 	if maxSrcParts > len(src) {
@@ -1472,21 +1760,28 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxOutByte
 	return append(dst, pws...)
 }
 
-func removeParts(pws []*partWrapper, partsToRemove map[*partWrapper]bool) ([]*partWrapper, int) {
-	removedParts := 0
+func sortPartsForOptimalMerge(pws []*partWrapper) {
+	// Sort src parts by size.
+	sort.Slice(pws, func(i, j int) bool {
+		return pws[i].p.size < pws[j].p.size
+	})
+}
+
+func removeParts(pws []*partWrapper, partsToRemove map[*partWrapper]struct{}) ([]*partWrapper, int) {
 	dst := pws[:0]
 	for _, pw := range pws {
-		if !partsToRemove[pw] {
+		if _, ok := partsToRemove[pw]; !ok {
 			dst = append(dst, pw)
-			continue
 		}
-		removedParts++
 	}
-	return dst, removedParts
+	for i := len(dst); i < len(pws); i++ {
+		pws[i] = nil
+	}
+	return dst, len(pws) - len(dst)
 }
 
 func isSpecialDir(name string) bool {
 	// Snapshots and cache dirs aren't used anymore.
 	// Keep them here for backwards compatibility.
-	return name == "tmp" || name == "txn" || name == "snapshots" || name == "cache"
+	return name == "tmp" || name == "txn" || name == "snapshots" || name == "cache" || fs.IsScheduledForRemoval(name)
 }

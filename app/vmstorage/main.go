@@ -4,10 +4,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
@@ -19,33 +22,33 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg"
-	"github.com/VictoriaMetrics/metrics"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 )
 
 var (
-	retentionPeriod   = flagutil.NewDuration("retentionPeriod", "1", "Data with timestamps outside the retentionPeriod is automatically deleted. See also -retentionFilter")
-	snapshotAuthKey   = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
-	forceMergeAuthKey = flag.String("forceMergeAuthKey", "", "authKey, which must be passed in query string to /internal/force_merge pages")
-	forceFlushAuthKey = flag.String("forceFlushAuthKey", "", "authKey, which must be passed in query string to /internal/force_flush pages")
+	retentionPeriod   = flagutil.NewDuration("retentionPeriod", "1", "Data with timestamps outside the retentionPeriod is automatically deleted. The minimum retentionPeriod is 24h or 1d. See also -retentionFilter")
+	snapshotAuthKey   = flagutil.NewPassword("snapshotAuthKey", "authKey, which must be passed in query string to /snapshot* pages")
+	forceMergeAuthKey = flagutil.NewPassword("forceMergeAuthKey", "authKey, which must be passed in query string to /internal/force_merge pages")
+	forceFlushAuthKey = flagutil.NewPassword("forceFlushAuthKey", "authKey, which must be passed in query string to /internal/force_flush pages")
 	snapshotsMaxAge   = flagutil.NewDuration("snapshotsMaxAge", "0", "Automatically delete snapshots older than -snapshotsMaxAge if it is set to non-zero duration. Make sure that backup process has enough time to finish the backup before the corresponding snapshot is automatically deleted")
+	_                 = flag.Duration("snapshotCreateTimeout", 0, "Deprecated: this flag does nothing")
 
 	precisionBits = flag.Int("precisionBits", 64, "The number of precision bits to store per each value. Lower precision bits improves data compression at the cost of precision loss")
 
 	// DataPath is a path to storage data.
 	DataPath = flag.String("storageDataPath", "victoria-metrics-data", "Path to storage data")
 
-	finalMergeDelay = flag.Duration("finalMergeDelay", 0, "The delay before starting final merge for per-month partition after no new data is ingested into it. "+
-		"Final merge may require additional disk IO and CPU resources. Final merge may increase query speed and reduce disk space usage in some cases. "+
-		"Zero value disables final merge")
-	bigMergeConcurrency     = flag.Int("bigMergeConcurrency", 0, "The maximum number of CPU cores to use for big merges. Default value is used if set to 0")
-	smallMergeConcurrency   = flag.Int("smallMergeConcurrency", 0, "The maximum number of CPU cores to use for small merges. Default value is used if set to 0")
+	_ = flag.Duration("finalMergeDelay", 0, "Deprecated: this flag does nothing")
+	_ = flag.Int("bigMergeConcurrency", 0, "Deprecated: this flag does nothing")
+	_ = flag.Int("smallMergeConcurrency", 0, "Deprecated: this flag does nothing")
+
 	retentionTimezoneOffset = flag.Duration("retentionTimezoneOffset", 0, "The offset for performing indexdb rotation. "+
 		"If set to 0, then the indexdb rotation is performed at 4am UTC time per each -retentionPeriod. "+
 		"If set to 2h, then the indexdb rotation is performed at 4am EET time (the timezone with +2h offset)")
 
 	logNewSeries = flag.Bool("logNewSeries", false, "Whether to log new series. This option is for debug purposes only. It can lead to performance issues "+
 		"when big number of new series are ingested into VictoriaMetrics")
-	denyQueriesOutsideRetention = flag.Bool("denyQueriesOutsideRetention", false, "Whether to deny queries outside of the configured -retentionPeriod. "+
+	denyQueriesOutsideRetention = flag.Bool("denyQueriesOutsideRetention", false, "Whether to deny queries outside the configured -retentionPeriod. "+
 		"When set, then /api/v1/query_range would return '503 Service Unavailable' error for queries with 'from' value outside -retentionPeriod. "+
 		"This may be useful when multiple data sources with distinct retentions are hidden behind query-tee")
 	maxHourlySeries = flag.Int("storage.maxHourlySeries", 0, "The maximum number of unique series can be added to the storage during the last hour. "+
@@ -72,7 +75,7 @@ func CheckTimeRange(tr storage.TimeRange) error {
 	if !*denyQueriesOutsideRetention {
 		return nil
 	}
-	minAllowedTimestamp := int64(fasttime.UnixTimestamp()*1000) - retentionPeriod.Msecs
+	minAllowedTimestamp := int64(fasttime.UnixTimestamp()*1000) - retentionPeriod.Milliseconds()
 	if tr.MinTimestamp > minAllowedTimestamp {
 		return nil
 	}
@@ -84,40 +87,26 @@ func CheckTimeRange(tr storage.TimeRange) error {
 
 // Init initializes vmstorage.
 func Init(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
-	InitWithoutMetrics(resetCacheIfNeeded)
-	registerStorageMetrics(Storage)
-}
-
-// InitWithoutMetrics must be called instead of Init inside tests.
-//
-// This allows multiple Init / Stop cycles.
-func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	if err := encoding.CheckPrecisionBits(uint8(*precisionBits)); err != nil {
 		logger.Fatalf("invalid `-precisionBits`: %s", err)
 	}
 
 	resetResponseCacheIfNeeded = resetCacheIfNeeded
 	storage.SetLogNewSeries(*logNewSeries)
-	storage.SetFinalMergeDelay(*finalMergeDelay)
-	storage.SetBigMergeWorkersCount(*bigMergeConcurrency)
-	storage.SetSmallMergeWorkersCount(*smallMergeConcurrency)
 	storage.SetRetentionTimezoneOffset(*retentionTimezoneOffset)
 	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)
-	storage.SetTSIDCacheSize(cacheSizeStorageTSID.N)
-	storage.SetTagFiltersCacheSize(cacheSizeIndexDBTagFilters.N)
-	mergeset.SetIndexBlocksCacheSize(cacheSizeIndexDBIndexBlocks.N)
-	mergeset.SetDataBlocksCacheSize(cacheSizeIndexDBDataBlocks.N)
+	storage.SetTSIDCacheSize(cacheSizeStorageTSID.IntN())
+	storage.SetTagFiltersCacheSize(cacheSizeIndexDBTagFilters.IntN())
+	mergeset.SetIndexBlocksCacheSize(cacheSizeIndexDBIndexBlocks.IntN())
+	mergeset.SetDataBlocksCacheSize(cacheSizeIndexDBDataBlocks.IntN())
 
-	if retentionPeriod.Msecs < 24*3600*1000 {
+	if retentionPeriod.Duration() < 24*time.Hour {
 		logger.Fatalf("-retentionPeriod cannot be smaller than a day; got %s", retentionPeriod)
 	}
 	logger.Infof("opening storage at %q with -retentionPeriod=%s", *DataPath, retentionPeriod)
 	startTime := time.Now()
 	WG = syncwg.WaitGroup{}
-	strg, err := storage.OpenStorage(*DataPath, retentionPeriod.Msecs, *maxHourlySeries, *maxDailySeries)
-	if err != nil {
-		logger.Fatalf("cannot open a storage at %s with -retentionPeriod=%s: %s", *DataPath, retentionPeriod, err)
-	}
+	strg := storage.MustOpenStorage(*DataPath, retentionPeriod.Duration(), *maxHourlySeries, *maxDailySeries)
 	Storage = strg
 	initStaleSnapshotsRemover(strg)
 
@@ -130,7 +119,16 @@ func InitWithoutMetrics(resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	sizeBytes := tm.SmallSizeBytes + tm.BigSizeBytes
 	logger.Infof("successfully opened storage %q in %.3f seconds; partsCount: %d; blocksCount: %d; rowsCount: %d; sizeBytes: %d",
 		*DataPath, time.Since(startTime).Seconds(), partsCount, blocksCount, rowsCount, sizeBytes)
+
+	// register storage metrics
+	storageMetrics = metrics.NewSet()
+	storageMetrics.RegisterMetricsWriter(func(w io.Writer) {
+		writeStorageMetrics(w, strg)
+	})
+	metrics.RegisterSet(storageMetrics)
 }
+
+var storageMetrics *metrics.Set
 
 // Storage is a storage.
 //
@@ -147,6 +145,8 @@ var WG syncwg.WaitGroup
 var resetResponseCacheIfNeeded func(mrs []storage.MetricRow)
 
 // AddRows adds mrs to the storage.
+//
+// The caller should limit the number of concurrent calls to AddRows() in order to limit memory usage.
 func AddRows(mrs []storage.MetricRow) error {
 	if Storage.IsReadOnly() {
 		return errReadOnly
@@ -161,11 +161,10 @@ func AddRows(mrs []storage.MetricRow) error {
 var errReadOnly = errors.New("the storage is in read-only mode; check -storage.minFreeDiskSpaceBytes command-line flag value")
 
 // RegisterMetricNames registers all the metrics from mrs in the storage.
-func RegisterMetricNames(qt *querytracer.Tracer, mrs []storage.MetricRow) error {
+func RegisterMetricNames(qt *querytracer.Tracer, mrs []storage.MetricRow) {
 	WG.Add(1)
-	err := Storage.RegisterMetricNames(qt, mrs)
+	Storage.RegisterMetricNames(qt, mrs)
 	WG.Done()
-	return err
 }
 
 // DeleteSeries deletes series matching tfss.
@@ -239,6 +238,10 @@ func GetSeriesCount(deadline uint64) (uint64, error) {
 
 // Stop stops the vmstorage
 func Stop() {
+	// deregister storage metrics
+	metrics.UnregisterSet(storageMetrics)
+	storageMetrics = nil
+
 	logger.Infof("gracefully closing the storage at %s", *DataPath)
 	startTime := time.Now()
 	WG.WaitAndBlock()
@@ -253,9 +256,7 @@ func Stop() {
 func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	path := r.URL.Path
 	if path == "/internal/force_merge" {
-		authKey := r.FormValue("authKey")
-		if authKey != *forceMergeAuthKey {
-			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -forceMergeAuthKey command line flag", authKey)
+		if !httpserver.CheckAuthFlag(w, r, forceMergeAuthKey.Get(), "forceMergeAuthKey") {
 			return true
 		}
 		// Run force merge in background
@@ -273,9 +274,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	if path == "/internal/force_flush" {
-		authKey := r.FormValue("authKey")
-		if authKey != *forceFlushAuthKey {
-			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -forceFlushAuthKey command line flag", authKey)
+		if !httpserver.CheckAuthFlag(w, r, forceFlushAuthKey.Get(), "forceFlushAuthKey") {
 			return true
 		}
 		logger.Infof("flushing storage to make pending data available for reading")
@@ -291,20 +290,20 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	if !strings.HasPrefix(path, "/snapshot") {
 		return false
 	}
-	authKey := r.FormValue("authKey")
-	if authKey != *snapshotAuthKey {
-		httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -snapshotAuthKey command line flag", authKey)
+	if !httpserver.CheckAuthFlag(w, r, snapshotAuthKey.Get(), "snapshotAuthKey") {
 		return true
 	}
 	path = path[len("/snapshot"):]
 
 	switch path {
 	case "/create":
+		snapshotsCreateTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		snapshotPath, err := Storage.CreateSnapshot()
 		if err != nil {
 			err = fmt.Errorf("cannot create snapshot: %w", err)
 			jsonResponseError(w, err)
+			snapshotsCreateErrorsTotal.Inc()
 			return true
 		}
 		if prometheusCompatibleResponse {
@@ -314,11 +313,13 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	case "/list":
+		snapshotsListTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		snapshots, err := Storage.ListSnapshots()
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)
 			jsonResponseError(w, err)
+			snapshotsListErrorsTotal.Inc()
 			return true
 		}
 		fmt.Fprintf(w, `{"status":"ok","snapshots":[`)
@@ -331,27 +332,48 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		fmt.Fprintf(w, `]}`)
 		return true
 	case "/delete":
+		snapshotsDeleteTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		snapshotName := r.FormValue("snapshot")
-		if err := Storage.DeleteSnapshot(snapshotName); err != nil {
-			err = fmt.Errorf("cannot delete snapshot %q: %w", snapshotName, err)
+
+		snapshots, err := Storage.ListSnapshots()
+		if err != nil {
+			err = fmt.Errorf("cannot list snapshots: %w", err)
 			jsonResponseError(w, err)
+			snapshotsDeleteErrorsTotal.Inc()
 			return true
 		}
-		fmt.Fprintf(w, `{"status":"ok"}`)
+		for _, snName := range snapshots {
+			if snName == snapshotName {
+				if err := Storage.DeleteSnapshot(snName); err != nil {
+					err = fmt.Errorf("cannot delete snapshot %q: %w", snName, err)
+					jsonResponseError(w, err)
+					snapshotsDeleteErrorsTotal.Inc()
+					return true
+				}
+				fmt.Fprintf(w, `{"status":"ok"}`)
+				return true
+			}
+		}
+
+		err = fmt.Errorf("cannot find snapshot %q", snapshotName)
+		jsonResponseError(w, err)
 		return true
 	case "/delete_all":
+		snapshotsDeleteAllTotal.Inc()
 		w.Header().Set("Content-Type", "application/json")
 		snapshots, err := Storage.ListSnapshots()
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)
 			jsonResponseError(w, err)
+			snapshotsDeleteAllErrorsTotal.Inc()
 			return true
 		}
 		for _, snapshotName := range snapshots {
 			if err := Storage.DeleteSnapshot(snapshotName); err != nil {
 				err = fmt.Errorf("cannot delete snapshot %q: %w", snapshotName, err)
 				jsonResponseError(w, err)
+				snapshotsDeleteAllErrorsTotal.Inc()
 				return true
 			}
 		}
@@ -364,14 +386,15 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 
 func initStaleSnapshotsRemover(strg *storage.Storage) {
 	staleSnapshotsRemoverCh = make(chan struct{})
-	if snapshotsMaxAge.Msecs <= 0 {
+	if snapshotsMaxAge.Duration() <= 0 {
 		return
 	}
-	snapshotsMaxAgeDur := time.Duration(snapshotsMaxAge.Msecs) * time.Millisecond
+	snapshotsMaxAgeDur := snapshotsMaxAge.Duration()
 	staleSnapshotsRemoverWG.Add(1)
 	go func() {
 		defer staleSnapshotsRemoverWG.Done()
-		t := time.NewTicker(11 * time.Second)
+		d := timeutil.AddJitterToDuration(time.Second * 11)
+		t := time.NewTicker(d)
 		defer t.Stop()
 		for {
 			select {
@@ -397,469 +420,212 @@ var (
 	staleSnapshotsRemoverWG sync.WaitGroup
 )
 
-var activeForceMerges = metrics.NewCounter("vm_active_force_merges")
+var (
+	activeForceMerges = metrics.NewCounter("vm_active_force_merges")
 
-func registerStorageMetrics(strg *storage.Storage) {
-	mCache := &storage.Metrics{}
-	var mCacheLock sync.Mutex
-	var lastUpdateTime time.Time
+	snapshotsCreateTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/create"}`)
+	snapshotsCreateErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/create"}`)
 
-	m := func() *storage.Metrics {
-		mCacheLock.Lock()
-		defer mCacheLock.Unlock()
-		if time.Since(lastUpdateTime) < time.Second {
-			return mCache
-		}
-		var mc storage.Metrics
-		strg.UpdateMetrics(&mc)
-		mCache = &mc
-		lastUpdateTime = time.Now()
-		return mCache
+	snapshotsListTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/list"}`)
+	snapshotsListErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/list"}`)
+
+	snapshotsDeleteTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/delete"}`)
+	snapshotsDeleteErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/delete"}`)
+
+	snapshotsDeleteAllTotal       = metrics.NewCounter(`vm_http_requests_total{path="/snapshot/delete_all"}`)
+	snapshotsDeleteAllErrorsTotal = metrics.NewCounter(`vm_http_request_errors_total{path="/snapshot/delete_all"}`)
+)
+
+func writeStorageMetrics(w io.Writer, strg *storage.Storage) {
+	var m storage.Metrics
+	strg.UpdateMetrics(&m)
+	tm := &m.TableMetrics
+	idbm := &m.IndexDBMetrics
+
+	metrics.WriteGaugeUint64(w, fmt.Sprintf(`vm_free_disk_space_bytes{path=%q}`, *DataPath), fs.MustGetFreeSpace(*DataPath))
+	metrics.WriteGaugeUint64(w, fmt.Sprintf(`vm_free_disk_space_limit_bytes{path=%q}`, *DataPath), uint64(minFreeDiskSpaceBytes.N))
+
+	isReadOnly := 0
+	if strg.IsReadOnly() {
+		isReadOnly = 1
 	}
-	tm := func() *storage.TableMetrics {
-		sm := m()
-		return &sm.TableMetrics
-	}
-	idbm := func() *storage.IndexDBMetrics {
-		sm := m()
-		return &sm.IndexDBMetrics
-	}
+	metrics.WriteGaugeUint64(w, fmt.Sprintf(`vm_storage_is_read_only{path=%q}`, *DataPath), uint64(isReadOnly))
 
-	metrics.NewGauge(fmt.Sprintf(`vm_free_disk_space_bytes{path=%q}`, *DataPath), func() float64 {
-		return float64(fs.MustGetFreeSpace(*DataPath))
-	})
-	metrics.NewGauge(fmt.Sprintf(`vm_free_disk_space_limit_bytes{path=%q}`, *DataPath), func() float64 {
-		return float64(minFreeDiskSpaceBytes.N)
-	})
-	metrics.NewGauge(fmt.Sprintf(`vm_storage_is_read_only{path=%q}`, *DataPath), func() float64 {
-		if strg.IsReadOnly() {
-			return 1
-		}
-		return 0
-	})
+	metrics.WriteGaugeUint64(w, `vm_active_merges{type="storage/inmemory"}`, tm.ActiveInmemoryMerges)
+	metrics.WriteGaugeUint64(w, `vm_active_merges{type="storage/small"}`, tm.ActiveSmallMerges)
+	metrics.WriteGaugeUint64(w, `vm_active_merges{type="storage/big"}`, tm.ActiveBigMerges)
+	metrics.WriteGaugeUint64(w, `vm_active_merges{type="indexdb/inmemory"}`, idbm.ActiveInmemoryMerges)
+	metrics.WriteGaugeUint64(w, `vm_active_merges{type="indexdb/file"}`, idbm.ActiveFileMerges)
 
-	metrics.NewGauge(`vm_active_merges{type="storage/big"}`, func() float64 {
-		return float64(tm().ActiveBigMerges)
-	})
-	metrics.NewGauge(`vm_active_merges{type="storage/small"}`, func() float64 {
-		return float64(tm().ActiveSmallMerges)
-	})
-	metrics.NewGauge(`vm_active_merges{type="indexdb"}`, func() float64 {
-		return float64(idbm().ActiveMerges)
-	})
+	metrics.WriteCounterUint64(w, `vm_merges_total{type="storage/inmemory"}`, tm.InmemoryMergesCount)
+	metrics.WriteCounterUint64(w, `vm_merges_total{type="storage/small"}`, tm.SmallMergesCount)
+	metrics.WriteCounterUint64(w, `vm_merges_total{type="storage/big"}`, tm.BigMergesCount)
+	metrics.WriteCounterUint64(w, `vm_merges_total{type="indexdb/inmemory"}`, idbm.InmemoryMergesCount)
+	metrics.WriteCounterUint64(w, `vm_merges_total{type="indexdb/file"}`, idbm.FileMergesCount)
 
-	metrics.NewGauge(`vm_merges_total{type="storage/big"}`, func() float64 {
-		return float64(tm().BigMergesCount)
-	})
-	metrics.NewGauge(`vm_merges_total{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallMergesCount)
-	})
-	metrics.NewGauge(`vm_merges_total{type="indexdb"}`, func() float64 {
-		return float64(idbm().MergesCount)
-	})
+	metrics.WriteCounterUint64(w, `vm_rows_merged_total{type="storage/inmemory"}`, tm.InmemoryRowsMerged)
+	metrics.WriteCounterUint64(w, `vm_rows_merged_total{type="storage/small"}`, tm.SmallRowsMerged)
+	metrics.WriteCounterUint64(w, `vm_rows_merged_total{type="storage/big"}`, tm.BigRowsMerged)
+	metrics.WriteCounterUint64(w, `vm_rows_merged_total{type="indexdb/inmemory"}`, idbm.InmemoryItemsMerged)
+	metrics.WriteCounterUint64(w, `vm_rows_merged_total{type="indexdb/file"}`, idbm.FileItemsMerged)
 
-	metrics.NewGauge(`vm_rows_merged_total{type="storage/big"}`, func() float64 {
-		return float64(tm().BigRowsMerged)
-	})
-	metrics.NewGauge(`vm_rows_merged_total{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallRowsMerged)
-	})
-	metrics.NewGauge(`vm_rows_merged_total{type="indexdb"}`, func() float64 {
-		return float64(idbm().ItemsMerged)
-	})
+	metrics.WriteCounterUint64(w, `vm_rows_deleted_total{type="storage/inmemory"}`, tm.InmemoryRowsDeleted)
+	metrics.WriteCounterUint64(w, `vm_rows_deleted_total{type="storage/small"}`, tm.SmallRowsDeleted)
+	metrics.WriteCounterUint64(w, `vm_rows_deleted_total{type="storage/big"}`, tm.BigRowsDeleted)
 
-	metrics.NewGauge(`vm_rows_deleted_total{type="storage/big"}`, func() float64 {
-		return float64(tm().BigRowsDeleted)
-	})
-	metrics.NewGauge(`vm_rows_deleted_total{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallRowsDeleted)
-	})
+	metrics.WriteGaugeUint64(w, `vm_part_references{type="storage/inmemory"}`, tm.InmemoryPartsRefCount)
+	metrics.WriteGaugeUint64(w, `vm_part_references{type="storage/small"}`, tm.SmallPartsRefCount)
+	metrics.WriteGaugeUint64(w, `vm_part_references{type="storage/big"}`, tm.BigPartsRefCount)
+	metrics.WriteGaugeUint64(w, `vm_partition_references{type="storage"}`, tm.PartitionsRefCount)
+	metrics.WriteGaugeUint64(w, `vm_object_references{type="indexdb"}`, idbm.IndexDBRefCount)
+	metrics.WriteGaugeUint64(w, `vm_part_references{type="indexdb"}`, idbm.PartsRefCount)
 
-	metrics.NewGauge(`vm_references{type="storage/big", name="parts"}`, func() float64 {
-		return float64(tm().BigPartsRefCount)
-	})
-	metrics.NewGauge(`vm_references{type="storage/small", name="parts"}`, func() float64 {
-		return float64(tm().SmallPartsRefCount)
-	})
-	metrics.NewGauge(`vm_references{type="storage", name="partitions"}`, func() float64 {
-		return float64(tm().PartitionsRefCount)
-	})
-	metrics.NewGauge(`vm_references{type="indexdb", name="objects"}`, func() float64 {
-		return float64(idbm().IndexDBRefCount)
-	})
-	metrics.NewGauge(`vm_references{type="indexdb", name="parts"}`, func() float64 {
-		return float64(idbm().PartsRefCount)
-	})
+	metrics.WriteCounterUint64(w, `vm_missing_tsids_for_metric_id_total`, idbm.MissingTSIDsForMetricID)
+	metrics.WriteCounterUint64(w, `vm_index_blocks_with_metric_ids_processed_total`, idbm.IndexBlocksWithMetricIDsProcessed)
+	metrics.WriteCounterUint64(w, `vm_index_blocks_with_metric_ids_incorrect_order_total`, idbm.IndexBlocksWithMetricIDsIncorrectOrder)
+	metrics.WriteGaugeUint64(w, `vm_composite_index_min_timestamp`, idbm.MinTimestampForCompositeIndex/1e3)
+	metrics.WriteCounterUint64(w, `vm_composite_filter_success_conversions_total`, idbm.CompositeFilterSuccessConversions)
+	metrics.WriteCounterUint64(w, `vm_composite_filter_missing_conversions_total`, idbm.CompositeFilterMissingConversions)
 
-	metrics.NewGauge(`vm_new_timeseries_created_total`, func() float64 {
-		return float64(idbm().NewTimeseriesCreated)
-	})
-	metrics.NewGauge(`vm_timeseries_repopulated_total`, func() float64 {
-		return float64(idbm().TimeseriesRepopulated)
-	})
-	metrics.NewGauge(`vm_missing_tsids_for_metric_id_total`, func() float64 {
-		return float64(idbm().MissingTSIDsForMetricID)
-	})
-	metrics.NewGauge(`vm_index_blocks_with_metric_ids_processed_total`, func() float64 {
-		return float64(idbm().IndexBlocksWithMetricIDsProcessed)
-	})
-	metrics.NewGauge(`vm_index_blocks_with_metric_ids_incorrect_order_total`, func() float64 {
-		return float64(idbm().IndexBlocksWithMetricIDsIncorrectOrder)
-	})
-	metrics.NewGauge(`vm_composite_index_min_timestamp`, func() float64 {
-		return float64(idbm().MinTimestampForCompositeIndex) / 1e3
-	})
-	metrics.NewGauge(`vm_composite_filter_success_conversions_total`, func() float64 {
-		return float64(idbm().CompositeFilterSuccessConversions)
-	})
-	metrics.NewGauge(`vm_composite_filter_missing_conversions_total`, func() float64 {
-		return float64(idbm().CompositeFilterMissingConversions)
-	})
+	// vm_assisted_merges_total name is used for backwards compatibility.
+	metrics.WriteCounterUint64(w, `vm_assisted_merges_total{type="indexdb/inmemory"}`, idbm.InmemoryPartsLimitReachedCount)
 
-	metrics.NewGauge(`vm_assisted_merges_total{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallAssistedMerges)
-	})
-	metrics.NewGauge(`vm_assisted_merges_total{type="indexdb"}`, func() float64 {
-		return float64(idbm().AssistedMerges)
-	})
+	metrics.WriteCounterUint64(w, `vm_indexdb_items_added_total`, idbm.ItemsAdded)
+	metrics.WriteCounterUint64(w, `vm_indexdb_items_added_size_bytes_total`, idbm.ItemsAddedSizeBytes)
 
-	metrics.NewGauge(`vm_indexdb_items_added_total`, func() float64 {
-		return float64(idbm().ItemsAdded)
-	})
-	metrics.NewGauge(`vm_indexdb_items_added_size_bytes_total`, func() float64 {
-		return float64(idbm().ItemsAddedSizeBytes)
-	})
+	metrics.WriteGaugeUint64(w, `vm_pending_rows{type="storage"}`, tm.PendingRows)
+	metrics.WriteGaugeUint64(w, `vm_pending_rows{type="indexdb"}`, idbm.PendingItems)
 
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/686
-	metrics.NewGauge(`vm_merge_need_free_disk_space{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallMergeNeedFreeDiskSpace)
-	})
-	metrics.NewGauge(`vm_merge_need_free_disk_space{type="storage/big"}`, func() float64 {
-		return float64(tm().BigMergeNeedFreeDiskSpace)
-	})
+	metrics.WriteGaugeUint64(w, `vm_parts{type="storage/inmemory"}`, tm.InmemoryPartsCount)
+	metrics.WriteGaugeUint64(w, `vm_parts{type="storage/small"}`, tm.SmallPartsCount)
+	metrics.WriteGaugeUint64(w, `vm_parts{type="storage/big"}`, tm.BigPartsCount)
+	metrics.WriteGaugeUint64(w, `vm_parts{type="indexdb/inmemory"}`, idbm.InmemoryPartsCount)
+	metrics.WriteGaugeUint64(w, `vm_parts{type="indexdb/file"}`, idbm.FilePartsCount)
 
-	metrics.NewGauge(`vm_pending_rows{type="storage"}`, func() float64 {
-		return float64(tm().PendingRows)
-	})
-	metrics.NewGauge(`vm_pending_rows{type="indexdb"}`, func() float64 {
-		return float64(idbm().PendingItems)
-	})
+	metrics.WriteGaugeUint64(w, `vm_last_partition_parts{type="storage/inmemory"}`, tm.LastPartition.InmemoryPartsCount)
+	metrics.WriteGaugeUint64(w, `vm_last_partition_parts{type="storage/small"}`, tm.LastPartition.SmallPartsCount)
+	metrics.WriteGaugeUint64(w, `vm_last_partition_parts{type="storage/big"}`, tm.LastPartition.BigPartsCount)
 
-	metrics.NewGauge(`vm_parts{type="storage/big"}`, func() float64 {
-		return float64(tm().BigPartsCount)
-	})
-	metrics.NewGauge(`vm_parts{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallPartsCount)
-	})
-	metrics.NewGauge(`vm_parts{type="indexdb"}`, func() float64 {
-		return float64(idbm().PartsCount)
-	})
+	metrics.WriteGaugeUint64(w, `vm_blocks{type="storage/inmemory"}`, tm.InmemoryBlocksCount)
+	metrics.WriteGaugeUint64(w, `vm_blocks{type="storage/small"}`, tm.SmallBlocksCount)
+	metrics.WriteGaugeUint64(w, `vm_blocks{type="storage/big"}`, tm.BigBlocksCount)
+	metrics.WriteGaugeUint64(w, `vm_blocks{type="indexdb/inmemory"}`, idbm.InmemoryBlocksCount)
+	metrics.WriteGaugeUint64(w, `vm_blocks{type="indexdb/file"}`, idbm.FileBlocksCount)
 
-	metrics.NewGauge(`vm_blocks{type="storage/big"}`, func() float64 {
-		return float64(tm().BigBlocksCount)
-	})
-	metrics.NewGauge(`vm_blocks{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallBlocksCount)
-	})
-	metrics.NewGauge(`vm_blocks{type="indexdb"}`, func() float64 {
-		return float64(idbm().BlocksCount)
-	})
+	metrics.WriteGaugeUint64(w, `vm_data_size_bytes{type="storage/inmemory"}`, tm.InmemorySizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_data_size_bytes{type="storage/small"}`, tm.SmallSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_data_size_bytes{type="storage/big"}`, tm.BigSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_data_size_bytes{type="indexdb/inmemory"}`, idbm.InmemorySizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_data_size_bytes{type="indexdb/file"}`, idbm.FileSizeBytes)
 
-	metrics.NewGauge(`vm_data_size_bytes{type="storage/big"}`, func() float64 {
-		return float64(tm().BigSizeBytes)
-	})
-	metrics.NewGauge(`vm_data_size_bytes{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallSizeBytes)
-	})
-	metrics.NewGauge(`vm_data_size_bytes{type="indexdb"}`, func() float64 {
-		return float64(idbm().SizeBytes)
-	})
+	metrics.WriteCounterUint64(w, `vm_rows_added_to_storage_total`, m.RowsAddedTotal)
+	metrics.WriteCounterUint64(w, `vm_deduplicated_samples_total{type="merge"}`, m.DedupsDuringMerge)
+	metrics.WriteGaugeUint64(w, `vm_snapshots`, m.SnapshotsCount)
 
-	metrics.NewGauge(`vm_rows_added_to_storage_total`, func() float64 {
-		return float64(m().RowsAddedTotal)
-	})
-	metrics.NewGauge(`vm_deduplicated_samples_total{type="merge"}`, func() float64 {
-		return float64(m().DedupsDuringMerge)
-	})
+	metrics.WriteCounterUint64(w, `vm_rows_ignored_total{reason="big_timestamp"}`, m.TooBigTimestampRows)
+	metrics.WriteCounterUint64(w, `vm_rows_ignored_total{reason="small_timestamp"}`, m.TooSmallTimestampRows)
 
-	metrics.NewGauge(`vm_rows_ignored_total{reason="big_timestamp"}`, func() float64 {
-		return float64(m().TooBigTimestampRows)
-	})
-	metrics.NewGauge(`vm_rows_ignored_total{reason="small_timestamp"}`, func() float64 {
-		return float64(m().TooSmallTimestampRows)
-	})
-
-	metrics.NewGauge(`vm_concurrent_addrows_limit_reached_total`, func() float64 {
-		return float64(m().AddRowsConcurrencyLimitReached)
-	})
-	metrics.NewGauge(`vm_concurrent_addrows_limit_timeout_total`, func() float64 {
-		return float64(m().AddRowsConcurrencyLimitTimeout)
-	})
-	metrics.NewGauge(`vm_concurrent_addrows_dropped_rows_total`, func() float64 {
-		return float64(m().AddRowsConcurrencyDroppedRows)
-	})
-	metrics.NewGauge(`vm_concurrent_addrows_capacity`, func() float64 {
-		return float64(m().AddRowsConcurrencyCapacity)
-	})
-	metrics.NewGauge(`vm_concurrent_addrows_current`, func() float64 {
-		return float64(m().AddRowsConcurrencyCurrent)
-	})
-
-	metrics.NewGauge(`vm_search_delays_total`, func() float64 {
-		return float64(m().SearchDelays)
-	})
-
-	metrics.NewGauge(`vm_slow_row_inserts_total`, func() float64 {
-		return float64(m().SlowRowInserts)
-	})
-	metrics.NewGauge(`vm_slow_per_day_index_inserts_total`, func() float64 {
-		return float64(m().SlowPerDayIndexInserts)
-	})
-	metrics.NewGauge(`vm_slow_metric_name_loads_total`, func() float64 {
-		return float64(m().SlowMetricNameLoads)
-	})
+	metrics.WriteCounterUint64(w, `vm_timeseries_repopulated_total`, m.TimeseriesRepopulated)
+	metrics.WriteCounterUint64(w, `vm_timeseries_precreated_total`, m.TimeseriesPreCreated)
+	metrics.WriteCounterUint64(w, `vm_new_timeseries_created_total`, m.NewTimeseriesCreated)
+	metrics.WriteCounterUint64(w, `vm_slow_row_inserts_total`, m.SlowRowInserts)
+	metrics.WriteCounterUint64(w, `vm_slow_per_day_index_inserts_total`, m.SlowPerDayIndexInserts)
+	metrics.WriteCounterUint64(w, `vm_slow_metric_name_loads_total`, m.SlowMetricNameLoads)
 
 	if *maxHourlySeries > 0 {
-		metrics.NewGauge(`vm_hourly_series_limit_current_series`, func() float64 {
-			return float64(m().HourlySeriesLimitCurrentSeries)
-		})
-		metrics.NewGauge(`vm_hourly_series_limit_max_series`, func() float64 {
-			return float64(m().HourlySeriesLimitMaxSeries)
-		})
-		metrics.NewGauge(`vm_hourly_series_limit_rows_dropped_total`, func() float64 {
-			return float64(m().HourlySeriesLimitRowsDropped)
-		})
+		metrics.WriteGaugeUint64(w, `vm_hourly_series_limit_current_series`, m.HourlySeriesLimitCurrentSeries)
+		metrics.WriteGaugeUint64(w, `vm_hourly_series_limit_max_series`, m.HourlySeriesLimitMaxSeries)
+		metrics.WriteCounterUint64(w, `vm_hourly_series_limit_rows_dropped_total`, m.HourlySeriesLimitRowsDropped)
 	}
 
 	if *maxDailySeries > 0 {
-		metrics.NewGauge(`vm_daily_series_limit_current_series`, func() float64 {
-			return float64(m().DailySeriesLimitCurrentSeries)
-		})
-		metrics.NewGauge(`vm_daily_series_limit_max_series`, func() float64 {
-			return float64(m().DailySeriesLimitMaxSeries)
-		})
-		metrics.NewGauge(`vm_daily_series_limit_rows_dropped_total`, func() float64 {
-			return float64(m().DailySeriesLimitRowsDropped)
-		})
+		metrics.WriteGaugeUint64(w, `vm_daily_series_limit_current_series`, m.DailySeriesLimitCurrentSeries)
+		metrics.WriteGaugeUint64(w, `vm_daily_series_limit_max_series`, m.DailySeriesLimitMaxSeries)
+		metrics.WriteCounterUint64(w, `vm_daily_series_limit_rows_dropped_total`, m.DailySeriesLimitRowsDropped)
 	}
 
-	metrics.NewGauge(`vm_timestamps_blocks_merged_total`, func() float64 {
-		return float64(m().TimestampsBlocksMerged)
-	})
-	metrics.NewGauge(`vm_timestamps_bytes_saved_total`, func() float64 {
-		return float64(m().TimestampsBytesSaved)
-	})
+	metrics.WriteCounterUint64(w, `vm_timestamps_blocks_merged_total`, m.TimestampsBlocksMerged)
+	metrics.WriteCounterUint64(w, `vm_timestamps_bytes_saved_total`, m.TimestampsBytesSaved)
 
-	metrics.NewGauge(`vm_rows{type="storage/big"}`, func() float64 {
-		return float64(tm().BigRowsCount)
-	})
-	metrics.NewGauge(`vm_rows{type="storage/small"}`, func() float64 {
-		return float64(tm().SmallRowsCount)
-	})
-	metrics.NewGauge(`vm_rows{type="indexdb"}`, func() float64 {
-		return float64(idbm().ItemsCount)
-	})
+	metrics.WriteGaugeUint64(w, `vm_rows{type="storage/inmemory"}`, tm.InmemoryRowsCount)
+	metrics.WriteGaugeUint64(w, `vm_rows{type="storage/small"}`, tm.SmallRowsCount)
+	metrics.WriteGaugeUint64(w, `vm_rows{type="storage/big"}`, tm.BigRowsCount)
+	metrics.WriteGaugeUint64(w, `vm_rows{type="indexdb/inmemory"}`, idbm.InmemoryItemsCount)
+	metrics.WriteGaugeUint64(w, `vm_rows{type="indexdb/file"}`, idbm.FileItemsCount)
 
-	metrics.NewGauge(`vm_date_range_search_calls_total`, func() float64 {
-		return float64(idbm().DateRangeSearchCalls)
-	})
-	metrics.NewGauge(`vm_date_range_hits_total`, func() float64 {
-		return float64(idbm().DateRangeSearchHits)
-	})
-	metrics.NewGauge(`vm_global_search_calls_total`, func() float64 {
-		return float64(idbm().GlobalSearchCalls)
-	})
+	metrics.WriteCounterUint64(w, `vm_date_range_search_calls_total`, idbm.DateRangeSearchCalls)
+	metrics.WriteCounterUint64(w, `vm_date_range_hits_total`, idbm.DateRangeSearchHits)
+	metrics.WriteCounterUint64(w, `vm_global_search_calls_total`, idbm.GlobalSearchCalls)
 
-	metrics.NewGauge(`vm_missing_metric_names_for_metric_id_total`, func() float64 {
-		return float64(idbm().MissingMetricNamesForMetricID)
-	})
+	metrics.WriteCounterUint64(w, `vm_missing_metric_names_for_metric_id_total`, idbm.MissingMetricNamesForMetricID)
 
-	metrics.NewGauge(`vm_date_metric_id_cache_syncs_total`, func() float64 {
-		return float64(m().DateMetricIDCacheSyncsCount)
-	})
-	metrics.NewGauge(`vm_date_metric_id_cache_resets_total`, func() float64 {
-		return float64(m().DateMetricIDCacheResetsCount)
-	})
+	metrics.WriteCounterUint64(w, `vm_date_metric_id_cache_syncs_total`, m.DateMetricIDCacheSyncsCount)
+	metrics.WriteCounterUint64(w, `vm_date_metric_id_cache_resets_total`, m.DateMetricIDCacheResetsCount)
 
-	metrics.NewGauge(`vm_cache_entries{type="storage/tsid"}`, func() float64 {
-		return float64(m().TSIDCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="storage/metricIDs"}`, func() float64 {
-		return float64(m().MetricIDCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="storage/metricName"}`, func() float64 {
-		return float64(m().MetricNameCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="storage/date_metricID"}`, func() float64 {
-		return float64(m().DateMetricIDCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="storage/hour_metric_ids"}`, func() float64 {
-		return float64(m().HourMetricIDCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="storage/next_day_metric_ids"}`, func() float64 {
-		return float64(m().NextDayMetricIDCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="storage/indexBlocks"}`, func() float64 {
-		return float64(tm().IndexBlocksCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="indexdb/dataBlocks"}`, func() float64 {
-		return float64(idbm().DataBlocksCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="indexdb/indexBlocks"}`, func() float64 {
-		return float64(idbm().IndexBlocksCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="indexdb/tagFiltersToMetricIDs"}`, func() float64 {
-		return float64(idbm().TagFiltersToMetricIDsCacheSize)
-	})
-	metrics.NewGauge(`vm_cache_entries{type="storage/regexps"}`, func() float64 {
-		return float64(storage.RegexpCacheSize())
-	})
-	metrics.NewGauge(`vm_cache_entries{type="storage/regexpPrefixes"}`, func() float64 {
-		return float64(storage.RegexpPrefixesCacheSize())
-	})
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/tsid"}`, m.TSIDCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/metricIDs"}`, m.MetricIDCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/metricName"}`, m.MetricNameCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/date_metricID"}`, m.DateMetricIDCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/hour_metric_ids"}`, m.HourMetricIDCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/next_day_metric_ids"}`, m.NextDayMetricIDCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/indexBlocks"}`, tm.IndexBlocksCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="indexdb/dataBlocks"}`, idbm.DataBlocksCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="indexdb/indexBlocks"}`, idbm.IndexBlocksCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="indexdb/tagFiltersToMetricIDs"}`, idbm.TagFiltersToMetricIDsCacheSize)
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/regexps"}`, uint64(storage.RegexpCacheSize()))
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/regexpPrefixes"}`, uint64(storage.RegexpPrefixesCacheSize()))
+	metrics.WriteGaugeUint64(w, `vm_cache_entries{type="storage/prefetchedMetricIDs"}`, m.PrefetchedMetricIDsSize)
 
-	metrics.NewGauge(`vm_cache_entries{type="storage/prefetchedMetricIDs"}`, func() float64 {
-		return float64(m().PrefetchedMetricIDsSize)
-	})
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/tsid"}`, m.TSIDCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/metricIDs"}`, m.MetricIDCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/metricName"}`, m.MetricNameCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/indexBlocks"}`, tm.IndexBlocksCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="indexdb/dataBlocks"}`, idbm.DataBlocksCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="indexdb/indexBlocks"}`, idbm.IndexBlocksCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/date_metricID"}`, m.DateMetricIDCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/hour_metric_ids"}`, m.HourMetricIDCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/next_day_metric_ids"}`, m.NextDayMetricIDCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="indexdb/tagFiltersToMetricIDs"}`, idbm.TagFiltersToMetricIDsCacheSizeBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/regexps"}`, uint64(storage.RegexpCacheSizeBytes()))
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/regexpPrefixes"}`, uint64(storage.RegexpPrefixesCacheSizeBytes()))
+	metrics.WriteGaugeUint64(w, `vm_cache_size_bytes{type="storage/prefetchedMetricIDs"}`, m.PrefetchedMetricIDsSizeBytes)
 
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/tsid"}`, func() float64 {
-		return float64(m().TSIDCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/metricIDs"}`, func() float64 {
-		return float64(m().MetricIDCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/metricName"}`, func() float64 {
-		return float64(m().MetricNameCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/indexBlocks"}`, func() float64 {
-		return float64(tm().IndexBlocksCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="indexdb/dataBlocks"}`, func() float64 {
-		return float64(idbm().DataBlocksCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="indexdb/indexBlocks"}`, func() float64 {
-		return float64(idbm().IndexBlocksCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/date_metricID"}`, func() float64 {
-		return float64(m().DateMetricIDCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/hour_metric_ids"}`, func() float64 {
-		return float64(m().HourMetricIDCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/next_day_metric_ids"}`, func() float64 {
-		return float64(m().NextDayMetricIDCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="indexdb/tagFiltersToMetricIDs"}`, func() float64 {
-		return float64(idbm().TagFiltersToMetricIDsCacheSizeBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/regexps"}`, func() float64 {
-		return float64(storage.RegexpCacheSizeBytes())
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/regexpPrefixes"}`, func() float64 {
-		return float64(storage.RegexpPrefixesCacheSizeBytes())
-	})
-	metrics.NewGauge(`vm_cache_size_bytes{type="storage/prefetchedMetricIDs"}`, func() float64 {
-		return float64(m().PrefetchedMetricIDsSizeBytes)
-	})
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="storage/tsid"}`, m.TSIDCacheSizeMaxBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="storage/metricIDs"}`, m.MetricIDCacheSizeMaxBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="storage/metricName"}`, m.MetricNameCacheSizeMaxBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="storage/indexBlocks"}`, tm.IndexBlocksCacheSizeMaxBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="indexdb/dataBlocks"}`, idbm.DataBlocksCacheSizeMaxBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="indexdb/indexBlocks"}`, idbm.IndexBlocksCacheSizeMaxBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="indexdb/tagFiltersToMetricIDs"}`, idbm.TagFiltersToMetricIDsCacheSizeMaxBytes)
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="storage/regexps"}`, uint64(storage.RegexpCacheMaxSizeBytes()))
+	metrics.WriteGaugeUint64(w, `vm_cache_size_max_bytes{type="storage/regexpPrefixes"}`, uint64(storage.RegexpPrefixesCacheMaxSizeBytes()))
 
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="storage/tsid"}`, func() float64 {
-		return float64(m().TSIDCacheSizeMaxBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="storage/metricIDs"}`, func() float64 {
-		return float64(m().MetricIDCacheSizeMaxBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="storage/metricName"}`, func() float64 {
-		return float64(m().MetricNameCacheSizeMaxBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="storage/indexBlocks"}`, func() float64 {
-		return float64(tm().IndexBlocksCacheSizeMaxBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="indexdb/dataBlocks"}`, func() float64 {
-		return float64(idbm().DataBlocksCacheSizeMaxBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="indexdb/indexBlocks"}`, func() float64 {
-		return float64(idbm().IndexBlocksCacheSizeMaxBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="indexdb/tagFiltersToMetricIDs"}`, func() float64 {
-		return float64(idbm().TagFiltersToMetricIDsCacheSizeMaxBytes)
-	})
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="storage/regexps"}`, func() float64 {
-		return float64(storage.RegexpCacheMaxSizeBytes())
-	})
-	metrics.NewGauge(`vm_cache_size_max_bytes{type="storage/regexpPrefixes"}`, func() float64 {
-		return float64(storage.RegexpPrefixesCacheMaxSizeBytes())
-	})
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="storage/tsid"}`, m.TSIDCacheRequests)
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="storage/metricIDs"}`, m.MetricIDCacheRequests)
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="storage/metricName"}`, m.MetricNameCacheRequests)
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="storage/indexBlocks"}`, tm.IndexBlocksCacheRequests)
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="indexdb/dataBlocks"}`, idbm.DataBlocksCacheRequests)
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="indexdb/indexBlocks"}`, idbm.IndexBlocksCacheRequests)
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="indexdb/tagFiltersToMetricIDs"}`, idbm.TagFiltersToMetricIDsCacheRequests)
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="storage/regexps"}`, storage.RegexpCacheRequests())
+	metrics.WriteCounterUint64(w, `vm_cache_requests_total{type="storage/regexpPrefixes"}`, storage.RegexpPrefixesCacheRequests())
 
-	metrics.NewGauge(`vm_cache_requests_total{type="storage/tsid"}`, func() float64 {
-		return float64(m().TSIDCacheRequests)
-	})
-	metrics.NewGauge(`vm_cache_requests_total{type="storage/metricIDs"}`, func() float64 {
-		return float64(m().MetricIDCacheRequests)
-	})
-	metrics.NewGauge(`vm_cache_requests_total{type="storage/metricName"}`, func() float64 {
-		return float64(m().MetricNameCacheRequests)
-	})
-	metrics.NewGauge(`vm_cache_requests_total{type="storage/indexBlocks"}`, func() float64 {
-		return float64(tm().IndexBlocksCacheRequests)
-	})
-	metrics.NewGauge(`vm_cache_requests_total{type="indexdb/dataBlocks"}`, func() float64 {
-		return float64(idbm().DataBlocksCacheRequests)
-	})
-	metrics.NewGauge(`vm_cache_requests_total{type="indexdb/indexBlocks"}`, func() float64 {
-		return float64(idbm().IndexBlocksCacheRequests)
-	})
-	metrics.NewGauge(`vm_cache_requests_total{type="indexdb/tagFiltersToMetricIDs"}`, func() float64 {
-		return float64(idbm().TagFiltersToMetricIDsCacheRequests)
-	})
-	metrics.NewGauge(`vm_cache_requests_total{type="storage/regexps"}`, func() float64 {
-		return float64(storage.RegexpCacheRequests())
-	})
-	metrics.NewGauge(`vm_cache_requests_total{type="storage/regexpPrefixes"}`, func() float64 {
-		return float64(storage.RegexpPrefixesCacheRequests())
-	})
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="storage/tsid"}`, m.TSIDCacheMisses)
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="storage/metricIDs"}`, m.MetricIDCacheMisses)
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="storage/metricName"}`, m.MetricNameCacheMisses)
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="storage/indexBlocks"}`, tm.IndexBlocksCacheMisses)
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="indexdb/dataBlocks"}`, idbm.DataBlocksCacheMisses)
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="indexdb/indexBlocks"}`, idbm.IndexBlocksCacheMisses)
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="indexdb/tagFiltersToMetricIDs"}`, idbm.TagFiltersToMetricIDsCacheMisses)
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="storage/regexps"}`, storage.RegexpCacheMisses())
+	metrics.WriteCounterUint64(w, `vm_cache_misses_total{type="storage/regexpPrefixes"}`, storage.RegexpPrefixesCacheMisses())
 
-	metrics.NewGauge(`vm_cache_misses_total{type="storage/tsid"}`, func() float64 {
-		return float64(m().TSIDCacheMisses)
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="storage/metricIDs"}`, func() float64 {
-		return float64(m().MetricIDCacheMisses)
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="storage/metricName"}`, func() float64 {
-		return float64(m().MetricNameCacheMisses)
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="storage/indexBlocks"}`, func() float64 {
-		return float64(tm().IndexBlocksCacheMisses)
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="indexdb/dataBlocks"}`, func() float64 {
-		return float64(idbm().DataBlocksCacheMisses)
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="indexdb/indexBlocks"}`, func() float64 {
-		return float64(idbm().IndexBlocksCacheMisses)
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="indexdb/tagFiltersToMetricIDs"}`, func() float64 {
-		return float64(idbm().TagFiltersToMetricIDsCacheMisses)
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="storage/regexps"}`, func() float64 {
-		return float64(storage.RegexpCacheMisses())
-	})
-	metrics.NewGauge(`vm_cache_misses_total{type="storage/regexpPrefixes"}`, func() float64 {
-		return float64(storage.RegexpPrefixesCacheMisses())
-	})
+	metrics.WriteCounterUint64(w, `vm_deleted_metrics_total{type="indexdb"}`, idbm.DeletedMetricsCount)
 
-	metrics.NewGauge(`vm_deleted_metrics_total{type="indexdb"}`, func() float64 {
-		return float64(idbm().DeletedMetricsCount)
-	})
+	metrics.WriteCounterUint64(w, `vm_cache_collisions_total{type="storage/tsid"}`, m.TSIDCacheCollisions)
+	metrics.WriteCounterUint64(w, `vm_cache_collisions_total{type="storage/metricName"}`, m.MetricNameCacheCollisions)
 
-	metrics.NewGauge(`vm_cache_collisions_total{type="storage/tsid"}`, func() float64 {
-		return float64(m().TSIDCacheCollisions)
-	})
-	metrics.NewGauge(`vm_cache_collisions_total{type="storage/metricName"}`, func() float64 {
-		return float64(m().MetricNameCacheCollisions)
-	})
-
-	metrics.NewGauge(`vm_next_retention_seconds`, func() float64 {
-		return float64(m().NextRetentionSeconds)
-	})
+	metrics.WriteGaugeUint64(w, `vm_next_retention_seconds`, m.NextRetentionSeconds)
 }
 
 func jsonResponseError(w http.ResponseWriter, err error) {

@@ -6,14 +6,20 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/metrics"
+
+	vminsertCommon "github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/csvimport"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/datadog"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/datadogsketches"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/datadogv1"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/datadogv2"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/graphite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/influx"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/native"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/newrelic"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/opentelemetry"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/opentsdb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/opentsdbhttp"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/prometheusimport"
@@ -23,6 +29,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/vmimport"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/influxutils"
 	graphiteserver "github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/graphite"
@@ -34,19 +41,30 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
-	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
-	graphiteListenAddr = flag.String("graphiteListenAddr", "", "TCP and UDP address to listen for Graphite plaintext data. Usually :2003 must be set. Doesn't work if empty")
-	influxListenAddr   = flag.String("influxListenAddr", "", "TCP and UDP address to listen for InfluxDB line protocol data. Usually :8089 must be set. Doesn't work if empty. "+
-		"This flag isn't needed when ingesting data over HTTP - just send it to http://<victoriametrics>:8428/write")
-	opentsdbListenAddr = flag.String("opentsdbListenAddr", "", "TCP and UDP address to listen for OpentTSDB metrics. "+
+	graphiteListenAddr = flag.String("graphiteListenAddr", "", "TCP and UDP address to listen for Graphite plaintext data. Usually :2003 must be set. Doesn't work if empty. "+
+		"See also -graphiteListenAddr.useProxyProtocol")
+	graphiteUseProxyProtocol = flag.Bool("graphiteListenAddr.useProxyProtocol", false, "Whether to use proxy protocol for connections accepted at -graphiteListenAddr . "+
+		"See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt")
+	influxListenAddr = flag.String("influxListenAddr", "", "TCP and UDP address to listen for InfluxDB line protocol data. Usually :8089 must be set. Doesn't work if empty. "+
+		"This flag isn't needed when ingesting data over HTTP - just send it to http://<victoriametrics>:8428/write . "+
+		"See also -influxListenAddr.useProxyProtocol")
+	influxUseProxyProtocol = flag.Bool("influxListenAddr.useProxyProtocol", false, "Whether to use proxy protocol for connections accepted at -influxListenAddr . "+
+		"See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt")
+	opentsdbListenAddr = flag.String("opentsdbListenAddr", "", "TCP and UDP address to listen for OpenTSDB metrics. "+
 		"Telnet put messages and HTTP /api/put messages are simultaneously served on TCP port. "+
-		"Usually :4242 must be set. Doesn't work if empty")
-	opentsdbHTTPListenAddr = flag.String("opentsdbHTTPListenAddr", "", "TCP address to listen for OpentTSDB HTTP put requests. Usually :4242 must be set. Doesn't work if empty")
-	configAuthKey          = flag.String("configAuthKey", "", "Authorization key for accessing /config page. It must be passed via authKey query arg")
+		"Usually :4242 must be set. Doesn't work if empty. "+
+		"See also -opentsdbListenAddr.useProxyProtocol")
+	opentsdbUseProxyProtocol = flag.Bool("opentsdbListenAddr.useProxyProtocol", false, "Whether to use proxy protocol for connections accepted at -opentsdbListenAddr . "+
+		"See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt")
+	opentsdbHTTPListenAddr = flag.String("opentsdbHTTPListenAddr", "", "TCP address to listen for OpenTSDB HTTP put requests. Usually :4242 must be set. Doesn't work if empty. "+
+		"See also -opentsdbHTTPListenAddr.useProxyProtocol")
+	opentsdbHTTPUseProxyProtocol = flag.Bool("opentsdbHTTPListenAddr.useProxyProtocol", false, "Whether to use proxy protocol for connections accepted "+
+		"at -opentsdbHTTPListenAddr . See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt")
+	configAuthKey          = flagutil.NewPassword("configAuthKey", "Authorization key for accessing /config page. It must be passed via authKey query arg")
+	reloadAuthKey          = flagutil.NewPassword("reloadAuthKey", "Auth key for /-/reload http endpoint. It must be passed as authKey=...")
 	maxLabelsPerTimeseries = flag.Int("maxLabelsPerTimeseries", 30, "The maximum number of labels accepted per time series. Superfluous labels are dropped. In this case the vm_metrics_with_dropped_labels_total metric at /metrics page is incremented")
 	maxLabelValueLen       = flag.Int("maxLabelValueLen", 16*1024, "The maximum length of label values in the accepted time series. Longer label values are truncated. In this case the vm_too_long_label_values_total metric at /metrics page is incremented")
 )
@@ -66,21 +84,21 @@ var staticServer = http.FileServer(http.FS(staticFiles))
 // Init initializes vminsert.
 func Init() {
 	relabel.Init()
+	vminsertCommon.InitStreamAggr()
 	storage.SetMaxLabelsPerTimeseries(*maxLabelsPerTimeseries)
 	storage.SetMaxLabelValueLen(*maxLabelValueLen)
 	common.StartUnmarshalWorkers()
-	writeconcurrencylimiter.Init()
 	if len(*graphiteListenAddr) > 0 {
-		graphiteServer = graphiteserver.MustStart(*graphiteListenAddr, graphite.InsertHandler)
+		graphiteServer = graphiteserver.MustStart(*graphiteListenAddr, *graphiteUseProxyProtocol, graphite.InsertHandler)
 	}
 	if len(*influxListenAddr) > 0 {
-		influxServer = influxserver.MustStart(*influxListenAddr, influx.InsertHandlerForReader)
+		influxServer = influxserver.MustStart(*influxListenAddr, *influxUseProxyProtocol, influx.InsertHandlerForReader)
 	}
 	if len(*opentsdbListenAddr) > 0 {
-		opentsdbServer = opentsdbserver.MustStart(*opentsdbListenAddr, opentsdb.InsertHandler, opentsdbhttp.InsertHandler)
+		opentsdbServer = opentsdbserver.MustStart(*opentsdbListenAddr, *opentsdbUseProxyProtocol, opentsdb.InsertHandler, opentsdbhttp.InsertHandler)
 	}
 	if len(*opentsdbHTTPListenAddr) > 0 {
-		opentsdbhttpServer = opentsdbhttpserver.MustStart(*opentsdbHTTPListenAddr, opentsdbhttp.InsertHandler)
+		opentsdbhttpServer = opentsdbhttpserver.MustStart(*opentsdbHTTPListenAddr, *opentsdbHTTPUseProxyProtocol, opentsdbhttp.InsertHandler)
 	}
 	promscrape.Init(func(at *auth.Token, wr *prompbmarshal.WriteRequest) {
 		prompush.Push(wr)
@@ -103,6 +121,7 @@ func Stop() {
 		opentsdbhttpServer.MustStop()
 	}
 	common.StopUnmarshalWorkers()
+	vminsertCommon.MustStopStreamAggr()
 }
 
 // RequestHandler is a handler for Prometheus remote storage write API
@@ -120,6 +139,23 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		staticServer.ServeHTTP(w, r)
 		return true
 	}
+	if strings.HasPrefix(path, "/prometheus/api/v1/import/prometheus") || strings.HasPrefix(path, "/api/v1/import/prometheus") {
+		prometheusimportRequests.Inc()
+		if err := prometheusimport.InsertHandler(r); err != nil {
+			prometheusimportErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		statusCode := http.StatusNoContent
+		if strings.HasPrefix(path, "/prometheus/api/v1/import/prometheus/metrics/job/") ||
+			strings.HasPrefix(path, "/api/v1/import/prometheus/metrics/job/") {
+			// Return 200 status code for pushgateway requests.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3636
+			statusCode = http.StatusOK
+		}
+		w.WriteHeader(statusCode)
+		return true
+	}
 	if strings.HasPrefix(path, "/datadog/") {
 		// Trim suffix from paths starting from /datadog/ in order to support legacy DataDog agent.
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/2670
@@ -127,6 +163,9 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 	}
 	switch path {
 	case "/prometheus/api/v1/write", "/api/v1/write":
+		if common.HandleVMProtoServerHandshake(w, r) {
+			return true
+		}
 		prometheusWriteRequests.Inc()
 		if err := promremotewrite.InsertHandler(r); err != nil {
 			prometheusWriteErrors.Inc()
@@ -148,15 +187,6 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		csvimportRequests.Inc()
 		if err := csvimport.InsertHandler(r); err != nil {
 			csvimportErrors.Inc()
-			httpserver.Errorf(w, r, "%s", err)
-			return true
-		}
-		w.WriteHeader(http.StatusNoContent)
-		return true
-	case "/prometheus/api/v1/import/prometheus", "/api/v1/import/prometheus":
-		prometheusimportRequests.Inc()
-		if err := prometheusimport.InsertHandler(r); err != nil {
-			prometheusimportErrors.Inc()
 			httpserver.Errorf(w, r, "%s", err)
 			return true
 		}
@@ -186,10 +216,53 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		addInfluxResponseHeaders(w)
 		influxutils.WriteDatabaseNames(w)
 		return true
+	case "/opentelemetry/api/v1/push", "/opentelemetry/v1/metrics":
+		opentelemetryPushRequests.Inc()
+		if err := opentelemetry.InsertHandler(r); err != nil {
+			opentelemetryPushErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.WriteHeader(http.StatusOK)
+		return true
+	case "/newrelic":
+		newrelicCheckRequest.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(202)
+		fmt.Fprintf(w, `{"status":"ok"}`)
+		return true
+	case "/newrelic/inventory/deltas":
+		newrelicInventoryRequests.Inc()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(202)
+		fmt.Fprintf(w, `{"payload":{"version": 1, "state": {}, "reset": "false"}}`)
+		return true
+	case "/newrelic/infra/v2/metrics/events/bulk":
+		newrelicWriteRequests.Inc()
+		if err := newrelic.InsertHandlerForHTTP(r); err != nil {
+			newrelicWriteErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(202)
+		fmt.Fprintf(w, `{"status":"ok"}`)
+		return true
 	case "/datadog/api/v1/series":
-		datadogWriteRequests.Inc()
-		if err := datadog.InsertHandlerForHTTP(r); err != nil {
-			datadogWriteErrors.Inc()
+		datadogv1WriteRequests.Inc()
+		if err := datadogv1.InsertHandlerForHTTP(r); err != nil {
+			datadogv1WriteErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(202)
+		fmt.Fprintf(w, `{"status":"ok"}`)
+		return true
+	case "/datadog/api/v2/series":
+		datadogv2WriteRequests.Inc()
+		if err := datadogv2.InsertHandlerForHTTP(r); err != nil {
+			datadogv2WriteErrors.Inc()
 			httpserver.Errorf(w, r, "%s", err)
 			return true
 		}
@@ -197,6 +270,15 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(202)
 		fmt.Fprintf(w, `{"status":"ok"}`)
+		return true
+	case "/datadog/api/beta/sketches":
+		datadogsketchesWriteRequests.Inc()
+		if err := datadogsketches.InsertHandlerForHTTP(r); err != nil {
+			datadogsketchesWriteErrors.Inc()
+			httpserver.Errorf(w, r, "%s", err)
+			return true
+		}
+		w.WriteHeader(202)
 		return true
 	case "/datadog/api/v1/validate":
 		datadogValidateRequests.Inc()
@@ -244,12 +326,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	case "/prometheus/config", "/config":
-		if *configAuthKey != "" && r.FormValue("authKey") != *configAuthKey {
-			err := &httpserver.ErrorWithStatusCode{
-				Err:        fmt.Errorf("The provided authKey doesn't match -configAuthKey"),
-				StatusCode: http.StatusUnauthorized,
-			}
-			httpserver.Errorf(w, r, "%s", err)
+		if !httpserver.CheckAuthFlag(w, r, configAuthKey.Get(), "configAuthKey") {
 			return true
 		}
 		promscrapeConfigRequests.Inc()
@@ -258,12 +335,7 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	case "/prometheus/api/v1/status/config", "/api/v1/status/config":
 		// See https://prometheus.io/docs/prometheus/latest/querying/api/#config
-		if *configAuthKey != "" && r.FormValue("authKey") != *configAuthKey {
-			err := &httpserver.ErrorWithStatusCode{
-				Err:        fmt.Errorf("The provided authKey doesn't match -configAuthKey"),
-				StatusCode: http.StatusUnauthorized,
-			}
-			httpserver.Errorf(w, r, "%s", err)
+		if !httpserver.CheckAuthFlag(w, r, configAuthKey.Get(), "configAuthKey") {
 			return true
 		}
 		promscrapeStatusConfigRequests.Inc()
@@ -273,12 +345,15 @@ func RequestHandler(w http.ResponseWriter, r *http.Request) bool {
 		fmt.Fprintf(w, `{"status":"success","data":{"yaml":%q}}`, bb.B)
 		return true
 	case "/prometheus/-/reload", "/-/reload":
+		if !httpserver.CheckAuthFlag(w, r, reloadAuthKey.Get(), "reloadAuthKey") {
+			return true
+		}
 		promscrapeConfigReloadRequests.Inc()
 		procutil.SelfSIGHUP()
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(http.StatusOK)
 		return true
 	case "/ready":
-		if rdy := atomic.LoadInt32(&promscrape.PendingScrapeConfigs); rdy > 0 {
+		if rdy := promscrape.PendingScrapeConfigs.Load(); rdy > 0 {
 			errMsg := fmt.Sprintf("waiting for scrape config to init targets, configs left: %d", rdy)
 			http.Error(w, errMsg, http.StatusTooEarly)
 		} else {
@@ -322,17 +397,33 @@ var (
 
 	influxQueryRequests = metrics.NewCounter(`vm_http_requests_total{path="/influx/query", protocol="influx"}`)
 
-	datadogWriteRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v1/series", protocol="datadog"}`)
-	datadogWriteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/datadog/api/v1/series", protocol="datadog"}`)
+	datadogv1WriteRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v1/series", protocol="datadog"}`)
+	datadogv1WriteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/datadog/api/v1/series", protocol="datadog"}`)
+
+	datadogv2WriteRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v2/series", protocol="datadog"}`)
+	datadogv2WriteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/datadog/api/v2/series", protocol="datadog"}`)
+
+	datadogsketchesWriteRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/beta/sketches", protocol="datadog"}`)
+	datadogsketchesWriteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/datadog/api/beta/sketches", protocol="datadog"}`)
 
 	datadogValidateRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v1/validate", protocol="datadog"}`)
 	datadogCheckRunRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v1/check_run", protocol="datadog"}`)
 	datadogIntakeRequests   = metrics.NewCounter(`vm_http_requests_total{path="/datadog/intake", protocol="datadog"}`)
 	datadogMetadataRequests = metrics.NewCounter(`vm_http_requests_total{path="/datadog/api/v1/metadata", protocol="datadog"}`)
 
+	opentelemetryPushRequests = metrics.NewCounter(`vm_http_requests_total{path="/opentelemetry/v1/metrics", protocol="opentelemetry"}`)
+	opentelemetryPushErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/opentelemetry/v1/metrics", protocol="opentelemetry"}`)
+
+	newrelicWriteRequests = metrics.NewCounter(`vm_http_requests_total{path="/newrelic/infra/v2/metrics/events/bulk", protocol="newrelic"}`)
+	newrelicWriteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/newrelic/infra/v2/metrics/events/bulk", protocol="newrelic"}`)
+
+	newrelicInventoryRequests = metrics.NewCounter(`vm_http_requests_total{path="/newrelic/inventory/deltas", protocol="newrelic"}`)
+	newrelicCheckRequest      = metrics.NewCounter(`vm_http_requests_total{path="/newrelic", protocol="newrelic"}`)
+
 	promscrapeTargetsRequests          = metrics.NewCounter(`vm_http_requests_total{path="/targets"}`)
 	promscrapeServiceDiscoveryRequests = metrics.NewCounter(`vm_http_requests_total{path="/service-discovery"}`)
-	promscrapeAPIV1TargetsRequests     = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/targets"}`)
+
+	promscrapeAPIV1TargetsRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/targets"}`)
 
 	promscrapeTargetResponseRequests = metrics.NewCounter(`vm_http_requests_total{path="/target_response"}`)
 	promscrapeTargetResponseErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/target_response"}`)
@@ -343,12 +434,12 @@ var (
 	promscrapeConfigReloadRequests = metrics.NewCounter(`vm_http_requests_total{path="/-/reload"}`)
 
 	_ = metrics.NewGauge(`vm_metrics_with_dropped_labels_total`, func() float64 {
-		return float64(atomic.LoadUint64(&storage.MetricsWithDroppedLabels))
+		return float64(storage.MetricsWithDroppedLabels.Load())
 	})
 	_ = metrics.NewGauge(`vm_too_long_label_names_total`, func() float64 {
-		return float64(atomic.LoadUint64(&storage.TooLongLabelNames))
+		return float64(storage.TooLongLabelNames.Load())
 	})
 	_ = metrics.NewGauge(`vm_too_long_label_values_total`, func() float64 {
-		return float64(atomic.LoadUint64(&storage.TooLongLabelValues))
+		return float64(storage.TooLongLabelValues.Load())
 	})
 )

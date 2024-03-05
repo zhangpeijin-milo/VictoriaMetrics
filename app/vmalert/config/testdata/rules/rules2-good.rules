@@ -5,6 +5,8 @@ groups:
     limit: 1000
     headers:
       - "MyHeader: foo"
+    notifier_headers:
+      - "MyHeader: foo"
     params:
       denyPartialResponse: ["true"]
     rules:
@@ -12,6 +14,7 @@ groups:
         expr: vm_tcplistener_conns > 0
         for: 3m
         debug: true
+        update_entries_limit: 40
         annotations:
           labels: "Available labels: {{ $labels }}"
           summary: Too high connection number for {{ $labels.instance }}
@@ -19,7 +22,9 @@ groups:
               {{ . | first | value }}
             {{ end }}
           description: "It is {{ $value }} connections for {{$labels.instance}}"
+          link: http://localhost:3000/d/wNf0q_kZk?viewPanel=51&from={{($activeAt.Add (parseDurationTime "1h")).UnixMilli}}&to={{($activeAt.Add (parseDurationTime "-1h")).UnixMilli}}
       - alert: ExampleAlertAlwaysFiring
+        update_entries_limit: -1
         expr: sum by(job)
           (up == 1)
         labels:

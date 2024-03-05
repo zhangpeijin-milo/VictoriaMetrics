@@ -40,10 +40,13 @@ type Server struct {
 
 // MustStart starts OpenTSDB collector on the given addr.
 //
+// If useProxyProtocol is set to true, then the incoming connections are accepted via proxy protocol.
+// See https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
+//
 // MustStop must be called on the returned server when it is no longer needed.
-func MustStart(addr string, telnetInsertHandler func(r io.Reader) error, httpInsertHandler func(req *http.Request) error) *Server {
+func MustStart(addr string, useProxyProtocol bool, telnetInsertHandler func(r io.Reader) error, httpInsertHandler func(req *http.Request) error) *Server {
 	logger.Infof("starting TCP OpenTSDB collector at %q", addr)
-	lnTCP, err := netutil.NewTCPListener("opentsdb", addr, nil)
+	lnTCP, err := netutil.NewTCPListener("opentsdb", addr, useProxyProtocol, nil)
 	if err != nil {
 		logger.Fatalf("cannot start TCP OpenTSDB collector at %q: %s", addr, err)
 	}
@@ -64,7 +67,7 @@ func MustStart(addr string, telnetInsertHandler func(r io.Reader) error, httpIns
 		httpServer: httpServer,
 		lnUDP:      lnUDP,
 	}
-	s.cm.Init()
+	s.cm.Init("opentsdb")
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -100,7 +103,7 @@ func (s *Server) MustStop() {
 	if err := s.lnUDP.Close(); err != nil {
 		logger.Errorf("cannot stop UDP OpenTSDB server: %s", err)
 	}
-	s.cm.CloseAll()
+	s.cm.CloseAll(0)
 	s.wg.Wait()
 	logger.Infof("TCP and UDP OpenTSDB servers at %q have been stopped", s.addr)
 }

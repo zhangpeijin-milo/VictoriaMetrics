@@ -1,10 +1,11 @@
 package prometheus
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 )
@@ -120,7 +121,7 @@ func (c *Client) Read(block tsdb.BlockReader) (storage.SeriesSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	ss := q.Select(false, nil, labels.MustNewMatcher(labels.MatchRegexp, c.filter.label, c.filter.labelValue))
+	ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchRegexp, c.filter.label, c.filter.labelValue))
 	return ss, nil
 }
 

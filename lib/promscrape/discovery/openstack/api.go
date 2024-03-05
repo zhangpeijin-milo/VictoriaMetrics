@@ -69,6 +69,10 @@ func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 }
 
 func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
+	port := sdc.Port
+	if port == 0 {
+		port = 80
+	}
 	cfg := &apiConfig{
 		client: &http.Client{
 			Transport: &http.Transport{
@@ -78,7 +82,7 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 		availability: sdc.Availability,
 		region:       sdc.Region,
 		allTenants:   sdc.AllTenants,
-		port:         sdc.Port,
+		port:         port,
 	}
 	if sdc.TLSConfig != nil {
 		opts := &promauth.Options{
@@ -87,10 +91,16 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 		}
 		ac, err := opts.NewConfig()
 		if err != nil {
-			return nil, err
+			cfg.client.CloseIdleConnections()
+			return nil, fmt.Errorf("cannot parse TLS config: %w", err)
+		}
+		tlsConfig, err := ac.NewTLSConfig()
+		if err != nil {
+			cfg.client.CloseIdleConnections()
+			return nil, fmt.Errorf("cannot initialize TLS config: %w", err)
 		}
 		cfg.client.Transport = &http.Transport{
-			TLSClientConfig:     ac.NewTLSConfig(),
+			TLSClientConfig:     tlsConfig,
 			MaxIdleConnsPerHost: 100,
 		}
 	}
@@ -107,6 +117,7 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 		sdcAuth = readCredentialsFromEnv()
 	}
 	if strings.HasSuffix(sdcAuth.IdentityEndpoint, "v2.0") {
+		cfg.client.CloseIdleConnections()
 		return nil, errors.New("identity_endpoint v2.0 is not supported")
 	}
 	// trim .0 from v3.0 for prometheus cfg compatibility
@@ -114,11 +125,13 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 
 	parsedURL, err := url.Parse(sdcAuth.IdentityEndpoint)
 	if err != nil {
-		return nil, fmt.Errorf("cannot parse identity_endpoint: %s as url, err: %w", sdcAuth.IdentityEndpoint, err)
+		cfg.client.CloseIdleConnections()
+		return nil, fmt.Errorf("cannot parse identity_endpoint %s as url: %w", sdcAuth.IdentityEndpoint, err)
 	}
 	cfg.endpoint = parsedURL
 	tokenReq, err := buildAuthRequestBody(&sdcAuth)
 	if err != nil {
+		cfg.client.CloseIdleConnections()
 		return nil, err
 	}
 	cfg.authTokenReq = tokenReq
@@ -136,7 +149,7 @@ func getCreds(cfg *apiConfig) (*apiCredentials, error) {
 
 	resp, err := cfg.client.Post(apiURL.String(), "application/json", bytes.NewBuffer(cfg.authTokenReq))
 	if err != nil {
-		return nil, fmt.Errorf("failed query openstack identity api, url: %s, err: %w", apiURL.String(), err)
+		return nil, fmt.Errorf("failed query openstack identity api at url %s: %w", apiURL.String(), err)
 	}
 	r, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -186,7 +199,7 @@ func getAPIResponse(apiURL string, cfg *apiConfig) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create new request for openstack api url %s: %w", apiURL, err)
 	}

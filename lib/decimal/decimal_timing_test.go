@@ -7,6 +7,28 @@ import (
 	"testing"
 )
 
+func BenchmarkCalbirateScale(b *testing.B) {
+	aSrc := []int64{1, 2, 3, 4, 5, 67, 8, 9, 12, 324, 29, -34, -94, -84, -34, 0, 2, 3}
+	bSrc := []int64{2, 3, 4, 5, 67, 8, 9, 12, 324, 29, -34, -94, -84, -34, 0, 2, 3, 1}
+	const aScale = 1
+	const bScale = 2
+	const scaleExpected = 1
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(aSrc)))
+	b.RunParallel(func(pb *testing.PB) {
+		var a, b []int64
+		for pb.Next() {
+			a = append(a[:0], aSrc...)
+			b = append(b[:0], bSrc...)
+			scale := CalibrateScale(a, aScale, b, bScale)
+			if scale != scaleExpected {
+				panic(fmt.Errorf("unexpected scale; got %d; want %d", scale, scaleExpected))
+			}
+		}
+	})
+}
+
 func BenchmarkAppendDecimalToFloat(b *testing.B) {
 	b.Run("RealFloat", func(b *testing.B) {
 		benchmarkAppendDecimalToFloat(b, testVA, vaScale)
@@ -29,7 +51,7 @@ func benchmarkAppendDecimalToFloat(b *testing.B, a []int64, scale int16) {
 		var fa []float64
 		for pb.Next() {
 			fa = AppendDecimalToFloat(fa[:0], a, scale)
-			atomic.AddUint64(&Sink, uint64(len(fa)))
+			Sink.Add(uint64(len(fa)))
 		}
 	})
 }
@@ -79,22 +101,24 @@ func benchmarkAppendFloatToDecimal(b *testing.B, fa []float64) {
 			sink += uint64(len(da))
 			sink += uint64(e)
 		}
-		atomic.AddUint64(&Sink, sink)
+		Sink.Add(sink)
 	})
 }
 
 var testFAReal = func() []float64 {
+	r := rand.New(rand.NewSource(1))
 	fa := make([]float64, 8*1024)
 	for i := 0; i < len(fa); i++ {
-		fa[i] = rand.NormFloat64() * 1e-6
+		fa[i] = r.NormFloat64() * 1e-6
 	}
 	return fa
 }()
 
 var testFAInteger = func() []float64 {
+	r := rand.New(rand.NewSource(2))
 	fa := make([]float64, 8*1024)
 	for i := 0; i < len(fa); i++ {
-		fa[i] = float64(int(rand.NormFloat64() * 1e6))
+		fa[i] = float64(int(r.NormFloat64() * 1e6))
 	}
 	return fa
 }()
@@ -114,10 +138,10 @@ func BenchmarkFromFloat(b *testing.B) {
 					sink += uint64(v)
 					sink += uint64(e)
 				}
-				atomic.AddUint64(&Sink, sink)
+				Sink.Add(sink)
 			})
 		})
 	}
 }
 
-var Sink uint64
+var Sink atomic.Uint64

@@ -95,6 +95,9 @@ func (b *Block) Init(tsid *TSID, timestamps, values []int64, scale int16, precis
 	b.bh.PrecisionBits = precisionBits
 	b.timestamps = append(b.timestamps[:0], timestamps...)
 	b.values = append(b.values[:0], values...)
+	if len(b.timestamps) > 0 {
+		b.fixupTimestamps()
+	}
 }
 
 // nextRow advances to the next row.
@@ -168,12 +171,12 @@ func (b *Block) deduplicateSamplesDuringMerge() {
 	srcValues := b.values[b.nextIdx:]
 	timestamps, values := deduplicateSamplesDuringMerge(srcTimestamps, srcValues, dedupInterval)
 	dedups := len(srcTimestamps) - len(timestamps)
-	atomic.AddUint64(&dedupsDuringMerge, uint64(dedups))
+	dedupsDuringMerge.Add(uint64(dedups))
 	b.timestamps = b.timestamps[:b.nextIdx+len(timestamps)]
 	b.values = b.values[:b.nextIdx+len(values)]
 }
 
-var dedupsDuringMerge uint64
+var dedupsDuringMerge atomic.Uint64
 
 func (b *Block) rowsCount() int {
 	if len(b.values) == 0 {

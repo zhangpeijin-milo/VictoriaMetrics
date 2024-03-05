@@ -4,18 +4,20 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestPartSearch(t *testing.T) {
-	p, items, err := newTestPart(10, 4000)
+	r := rand.New(rand.NewSource(1))
+	p, items, err := newTestPart(r, 10, 4000)
 	if err != nil {
 		t.Fatalf("cannot create test part: %s", err)
 	}
 
 	t.Run("serial", func(t *testing.T) {
-		if err := testPartSearchSerial(p, items); err != nil {
+		if err := testPartSearchSerial(r, p, items); err != nil {
 			t.Fatalf("error in serial part search test: %s", err)
 		}
 	})
@@ -31,9 +33,10 @@ func testPartSearchConcurrent(p *part, items []string) error {
 	const goroutinesCount = 5
 	ch := make(chan error, goroutinesCount)
 	for i := 0; i < goroutinesCount; i++ {
-		go func() {
-			ch <- testPartSearchSerial(p, items)
-		}()
+		go func(n int) {
+			rLocal := rand.New(rand.NewSource(int64(n)))
+			ch <- testPartSearchSerial(rLocal, p, items)
+		}(i)
 	}
 	for i := 0; i < goroutinesCount; i++ {
 		select {
@@ -48,7 +51,7 @@ func testPartSearchConcurrent(p *part, items []string) error {
 	return nil
 }
 
-func testPartSearchSerial(p *part, items []string) error {
+func testPartSearchSerial(r *rand.Rand, p *part, items []string) error {
 	var ps partSearch
 
 	ps.Init(p)
@@ -88,7 +91,7 @@ func testPartSearchSerial(p *part, items []string) error {
 
 	// Search for inner items
 	for loop := 0; loop < 100; loop++ {
-		idx := rand.Intn(len(items))
+		idx := r.Intn(len(items))
 		k = append(k[:0], items[idx]...)
 		ps.Seek(k)
 		n := sort.Search(len(items), func(i int) bool {
@@ -143,23 +146,20 @@ func testPartSearchSerial(p *part, items []string) error {
 	return nil
 }
 
-func newTestPart(blocksCount, maxItemsPerBlock int) (*part, []string, error) {
-	bsrs, items := newTestInmemoryBlockStreamReaders(blocksCount, maxItemsPerBlock)
+func newTestPart(r *rand.Rand, blocksCount, maxItemsPerBlock int) (*part, []string, error) {
+	bsrs, items := newTestInmemoryBlockStreamReaders(r, blocksCount, maxItemsPerBlock)
 
-	var itemsMerged uint64
+	var itemsMerged atomic.Uint64
 	var ip inmemoryPart
 	var bsw blockStreamWriter
-	bsw.InitFromInmemoryPart(&ip)
+	bsw.MustInitFromInmemoryPart(&ip, -3)
 	if err := mergeBlockStreams(&ip.ph, &bsw, bsrs, nil, nil, &itemsMerged); err != nil {
 		return nil, nil, fmt.Errorf("cannot merge blocks: %w", err)
 	}
-	if itemsMerged != uint64(len(items)) {
-		return nil, nil, fmt.Errorf("unexpected itemsMerged; got %d; want %d", itemsMerged, len(items))
+	if n := itemsMerged.Load(); n != uint64(len(items)) {
+		return nil, nil, fmt.Errorf("unexpected itemsMerged; got %d; want %d", n, len(items))
 	}
 	size := ip.size()
-	p, err := newPart(&ip.ph, "partName", size, ip.metaindexData.NewReader(), &ip.indexData, &ip.itemsData, &ip.lensData)
-	if err != nil {
-		return nil, nil, fmt.Errorf("cannot create part: %w", err)
-	}
+	p := newPart(&ip.ph, "partName", size, ip.metaindexData.NewReader(), &ip.indexData, &ip.itemsData, &ip.lensData)
 	return p, items, nil
 }
