@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"strconv"
 	"strings"
 )
@@ -44,6 +45,11 @@ func NewTokenPossibleMultitenant(authToken string) (*Token, error) {
 
 // Init initializes t from authToken.
 func (t *Token) Init(authToken string) error {
+	if len(authToken) == 0 {
+		t.Set(0, 0)
+		logger.Warnf("authToken is empty, use DefaultAuthToken [0:0]")
+		return nil
+	}
 	tmp := strings.Split(authToken, ":")
 	if len(tmp) > 2 {
 		return fmt.Errorf("unexpected number of items in authToken %q; got %d; want 1 or 2", authToken, len(tmp))
