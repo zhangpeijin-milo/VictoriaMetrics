@@ -98,14 +98,14 @@ func Init(ctx context.Context) (*Client, error) {
 	}
 
 	return NewClient(ctx, Config{
-		URL:               *addr,
-		BaseURL:           BaseURL,
-		Suffix:            Suffix,
-		AuthCfg:           authCfg,
-		Concurrency:       *concurrency,
-		MaxQueueSize:      *maxQueueSize,
-		MaxBatchSize:      *maxBatchSize,
-		FlushInterval:     *flushInterval,
-		Transport:         t,
+		Addr:          *addr,
+		BaseURL:       BaseURL,
+		Suffix:        Suffix,
+		AuthCfg:       authCfg,
+		Concurrency:   *concurrency,
+		MaxQueueSize:  *maxQueueSize,
+		MaxBatchSize:  *maxBatchSize,
+		FlushInterval: *flushInterval,
+		Transport:     t,
 	})
 }

@@ -49,11 +49,6 @@ type Group struct {
 	XXX map[string]interface{} `yaml:",inline"`
 }
 
-type Tenant struct {
-	AccountID uint32 `yaml:"accountID"`
-	ProjectID uint32 `yaml:"projectID,omitempty"`
-}
-
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
 func (g *Group) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type group Group

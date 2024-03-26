@@ -154,7 +154,7 @@ func (s *VMStorage) Query(ctx context.Context, query string, ts time.Time, at *a
 		}
 		// Something in the middle between client and datasource might be closing
 		// the connection. So we do a one more attempt in hope request will succeed.
-		req, err = s.newQueryRequest(ctx, query, ts)
+		req, err = s.newQueryRequest(ctx, query, ts, at)
 		if err != nil {
 			return Result{}, nil, fmt.Errorf("second attempt: %w", err)
 		}
@@ -187,7 +187,7 @@ func (s *VMStorage) QueryRange(ctx context.Context, query string, start, end tim
 	if end.IsZero() {
 		return res, fmt.Errorf("end param is missing")
 	}
-	req, err := s.newQueryRangeRequest(ctx, query, start, end)
+	req, err := s.newQueryRangeRequest(ctx, query, start, end, at)
 	if err != nil {
 		return res, err
 	}
@@ -199,7 +199,7 @@ func (s *VMStorage) QueryRange(ctx context.Context, query string, start, end tim
 		}
 		// Something in the middle between client and datasource might be closing
 		// the connection. So we do a one more attempt in hope request will succeed.
-		req, err = s.newQueryRangeRequest(ctx, query, start, end)
+		req, err = s.newQueryRangeRequest(ctx, query, start, end, at)
 		if err != nil {
 			return res, fmt.Errorf("second attempt: %w", err)
 		}
@@ -236,19 +236,18 @@ func (s *VMStorage) do(req *http.Request) (*http.Response, error) {
 }
 
 func (s *VMStorage) newQueryRangeRequest(ctx context.Context, query string, start, end time.Time, at *auth.Token) (*http.Request, error) {
-	requestURL := fmt.Sprintf("%s/%s/%s", BaseURL, at.String(), Suffix)
-	req, err := s.newRequest(ctx)
+	req, err := s.newRequest(ctx, at)
 	if err != nil {
-		return nil, fmt.Errorf("cannot create query_range request to datasource %q: %w", s.datasourceURL, err)
+		return nil, fmt.Errorf("cannot create query_range request to datasource %q: %w", s.baseURL+s.suffix, err)
 	}
 	s.setPrometheusRangeReqParams(req, query, start, end)
 	return req, nil
 }
 
-func (s *VMStorage) newQueryRequest(ctx context.Context, query string, ts time.Time) (*http.Request, error) {
-	req, err := s.newRequest(ctx)
+func (s *VMStorage) newQueryRequest(ctx context.Context, query string, ts time.Time, at *auth.Token) (*http.Request, error) {
+	req, err := s.newRequest(ctx, at)
 	if err != nil {
-		return nil, fmt.Errorf("cannot create query request to datasource %q: %w", s.datasourceURL, err)
+		return nil, fmt.Errorf("cannot create query request to datasource %q: %w", fmt.Sprintf("%s/%s/%s", s.baseURL, at.String(), s.suffix), err)
 	}
 	switch s.dataSourceType {
 	case "", datasourcePrometheus:
@@ -261,12 +260,12 @@ func (s *VMStorage) newQueryRequest(ctx context.Context, query string, ts time.T
 	return req, nil
 }
 
-func (s *VMStorage) newRequest(ctx context.Context) (*http.Request, error) {
-	requestURL := fmt.Sprintf("%s/%s/%s", s.BaseURL, at.String(), s.Suffix)
+func (s *VMStorage) newRequest(ctx context.Context, at *auth.Token) (*http.Request, error) {
+	requestURL := fmt.Sprintf("%s/%s/%s", s.baseURL, at.String(), s.suffix)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, nil)
 	if err != nil {
-		logger.Panicf("BUG: unexpected error from http.NewRequest(%q): %s", s.datasourceURL, err)
+		logger.Panicf("BUG: unexpected error from http.NewRequest(%q): %s", requestURL, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if s.authCfg != nil {

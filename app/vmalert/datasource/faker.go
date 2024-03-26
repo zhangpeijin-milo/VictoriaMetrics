@@ -2,6 +2,7 @@ package datasource
 
 import (
 	"context"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"net/http"
 	"sync"
 	"time"
@@ -42,13 +43,13 @@ func (fq *FakeQuerier) BuildWithParams(_ QuerierParams) Querier {
 }
 
 // QueryRange performs query
-func (fq *FakeQuerier) QueryRange(ctx context.Context, q string, _, _ time.Time) (Result, error) {
-	req, _, err := fq.Query(ctx, q, time.Now())
+func (fq *FakeQuerier) QueryRange(ctx context.Context, q string, _, _ time.Time, at *auth.Token) (Result, error) {
+	req, _, err := fq.Query(ctx, q, time.Now(), at)
 	return req, err
 }
 
 // Query returns metrics restored in querier
-func (fq *FakeQuerier) Query(_ context.Context, _ string, _ time.Time) (Result, *http.Request, error) {
+func (fq *FakeQuerier) Query(_ context.Context, _ string, _ time.Time, at *auth.Token) (Result, *http.Request, error) {
 	fq.Lock()
 	defer fq.Unlock()
 	if fq.err != nil {
@@ -89,13 +90,13 @@ func (fqr *FakeQuerierWithRegistry) BuildWithParams(_ QuerierParams) Querier {
 }
 
 // QueryRange performs query
-func (fqr *FakeQuerierWithRegistry) QueryRange(ctx context.Context, q string, _, _ time.Time) (Result, error) {
-	req, _, err := fqr.Query(ctx, q, time.Now())
+func (fqr *FakeQuerierWithRegistry) QueryRange(ctx context.Context, q string, _, _ time.Time, at *auth.Token) (Result, error) {
+	req, _, err := fqr.Query(ctx, q, time.Now(), at)
 	return req, err
 }
 
 // Query returns metrics restored in querier registry
-func (fqr *FakeQuerierWithRegistry) Query(_ context.Context, expr string, _ time.Time) (Result, *http.Request, error) {
+func (fqr *FakeQuerierWithRegistry) Query(_ context.Context, expr string, _ time.Time, at *auth.Token) (Result, *http.Request, error) {
 	fqr.Lock()
 	defer fqr.Unlock()
 
@@ -116,13 +117,13 @@ type FakeQuerierWithDelay struct {
 }
 
 // Query returns query result after delay duration
-func (fqd *FakeQuerierWithDelay) Query(ctx context.Context, expr string, ts time.Time) (Result, *http.Request, error) {
+func (fqd *FakeQuerierWithDelay) Query(ctx context.Context, expr string, ts time.Time, at *auth.Token) (Result, *http.Request, error) {
 	timer := time.NewTimer(fqd.Delay)
 	select {
 	case <-ctx.Done():
 	case <-timer.C:
 	}
-	return fqd.FakeQuerier.Query(ctx, expr, ts)
+	return fqd.FakeQuerier.Query(ctx, expr, ts, at)
 }
 
 // BuildWithParams returns itself

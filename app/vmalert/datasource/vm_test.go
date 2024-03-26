@@ -3,6 +3,7 @@ package datasource
 import (
 	"context"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -86,14 +87,17 @@ func TestVMInstantQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected: %s", err)
 	}
-	s := NewVMStorage(srv.URL, authCfg, time.Minute, 0, false, srv.Client())
+	s := NewVMStorage(srv.URL, "", authCfg, time.Minute, 0, false, srv.Client())
 
 	p := datasourcePrometheus
 	pq := s.BuildWithParams(QuerierParams{DataSourceType: string(p), EvaluationInterval: 15 * time.Second})
 	ts := time.Now()
 
 	expErr := func(err string) {
-		_, _, gotErr := pq.Query(ctx, query, ts)
+		_, _, gotErr := pq.Query(ctx, query, ts, &auth.Token{
+			AccountID: 111,
+			ProjectID: 222,
+		})
 		if gotErr == nil {
 			t.Fatalf("expected %q got nil", err)
 		}
@@ -108,7 +112,10 @@ func TestVMInstantQuery(t *testing.T) {
 	expErr("unknown status")                   // 3
 	expErr("unexpected end of JSON input")     // 4
 
-	res, _, err := pq.Query(ctx, query, ts) // 5 - vector
+	res, _, err := pq.Query(ctx, query, ts, &auth.Token{
+		AccountID: 111,
+		ProjectID: 222,
+	}) // 5 - vector
 	if err != nil {
 		t.Fatalf("unexpected %s", err)
 	}
@@ -129,7 +136,10 @@ func TestVMInstantQuery(t *testing.T) {
 	}
 	metricsEqual(t, res.Data, expected)
 
-	res, req, err := pq.Query(ctx, query, ts) // 6 - scalar
+	res, req, err := pq.Query(ctx, query, ts, &auth.Token{
+		AccountID: 111,
+		ProjectID: 222,
+	}) // 6 - scalar
 	if err != nil {
 		t.Fatalf("unexpected %s", err)
 	}
@@ -154,7 +164,10 @@ func TestVMInstantQuery(t *testing.T) {
 			res.SeriesFetched)
 	}
 
-	res, _, err = pq.Query(ctx, query, ts) // 7 - scalar with stats
+	res, _, err = pq.Query(ctx, query, ts, &auth.Token{
+		AccountID: 111,
+		ProjectID: 222,
+	}) // 7 - scalar with stats
 	if err != nil {
 		t.Fatalf("unexpected %s", err)
 	}
@@ -177,7 +190,10 @@ func TestVMInstantQuery(t *testing.T) {
 
 	gq := s.BuildWithParams(QuerierParams{DataSourceType: string(datasourceGraphite)})
 
-	res, _, err = gq.Query(ctx, queryRender, ts) // 8 - graphite
+	res, _, err = gq.Query(ctx, queryRender, ts, &auth.Token{
+		AccountID: 111,
+		ProjectID: 222,
+	}) // 8 - graphite
 	if err != nil {
 		t.Fatalf("unexpected %s", err)
 	}
@@ -225,11 +241,14 @@ func TestVMInstantQueryWithRetry(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	s := NewVMStorage(srv.URL, nil, time.Minute, 0, false, srv.Client())
+	s := NewVMStorage(srv.URL, "", nil, time.Minute, 0, false, srv.Client())
 	pq := s.BuildWithParams(QuerierParams{DataSourceType: string(datasourcePrometheus)})
 
 	expErr := func(err string) {
-		_, _, gotErr := pq.Query(ctx, query, time.Now())
+		_, _, gotErr := pq.Query(ctx, query, time.Now(), &auth.Token{
+			AccountID: 111,
+			ProjectID: 222,
+		})
 		if gotErr == nil {
 			t.Fatalf("expected %q got nil", err)
 		}
@@ -239,7 +258,10 @@ func TestVMInstantQueryWithRetry(t *testing.T) {
 	}
 
 	expValue := func(v float64) {
-		res, _, err := pq.Query(ctx, query, time.Now())
+		res, _, err := pq.Query(ctx, query, time.Now(), &auth.Token{
+			AccountID: 111,
+			ProjectID: 222,
+		})
 		if err != nil {
 			t.Fatalf("unexpected %s", err)
 		}
@@ -334,19 +356,28 @@ func TestVMRangeQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected: %s", err)
 	}
-	s := NewVMStorage(srv.URL, authCfg, time.Minute, *queryStep, false, srv.Client())
+	s := NewVMStorage(srv.URL, "", authCfg, time.Minute, *queryStep, false, srv.Client())
 
 	pq := s.BuildWithParams(QuerierParams{DataSourceType: string(datasourcePrometheus), EvaluationInterval: 15 * time.Second})
 
-	_, err = pq.QueryRange(ctx, query, time.Now(), time.Time{})
+	_, err = pq.QueryRange(ctx, query, time.Now(), time.Time{}, &auth.Token{
+		AccountID: 111,
+		ProjectID: 222,
+	})
 	expectError(t, err, "is missing")
 
-	_, err = pq.QueryRange(ctx, query, time.Time{}, time.Now())
+	_, err = pq.QueryRange(ctx, query, time.Time{}, time.Now(), &auth.Token{
+		AccountID: 111,
+		ProjectID: 222,
+	})
 	expectError(t, err, "is missing")
 
 	start, end := time.Now().Add(-time.Minute), time.Now()
 
-	res, err := pq.QueryRange(ctx, query, start, end)
+	res, err := pq.QueryRange(ctx, query, start, end, &auth.Token{
+		AccountID: 111,
+		ProjectID: 222,
+	})
 	if err != nil {
 		t.Fatalf("unexpected %s", err)
 	}
@@ -365,7 +396,10 @@ func TestVMRangeQuery(t *testing.T) {
 
 	gq := s.BuildWithParams(QuerierParams{DataSourceType: string(datasourceGraphite)})
 
-	_, err = gq.QueryRange(ctx, queryRender, start, end)
+	_, err = gq.QueryRange(ctx, queryRender, start, end, &auth.Token{
+		AccountID: 111,
+		ProjectID: 222,
+	})
 	expectError(t, err, "is not supported")
 }
 
@@ -637,7 +671,11 @@ func TestRequestParams(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			req, err := tc.vm.newRequest(ctx)
+			at := &auth.Token{
+				AccountID: 111,
+				ProjectID: 222,
+			}
+			req, err := tc.vm.newRequest(ctx, at)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -735,7 +773,10 @@ func TestHeaders(t *testing.T) {
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			vm := tt.vmFn()
-			req, err := vm.newQueryRequest(ctx, "foo", time.Now())
+			req, err := vm.newQueryRequest(ctx, "foo", time.Now(), &auth.Token{
+				AccountID: 111,
+				ProjectID: 222,
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
