@@ -3,6 +3,7 @@ package rule
 import (
 	"context"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ type RecordingRule struct {
 	Labels    map[string]string
 	GroupID   uint64
 	GroupName string
+	GroupAuthToken *auth.Token
 	File      string
 
 	q datasource.Querier
@@ -45,6 +47,11 @@ func (rr *RecordingRule) String() string {
 	return rr.Name
 }
 
+// AuthToken returns the auth token of the recording rule
+func (rr *RecordingRule) AuthToken() *auth.Token {
+	return rr.GroupAuthToken
+}
+
 // ID returns unique Rule ID
 // within the parent Group.
 func (rr *RecordingRule) ID() uint64 {
@@ -61,6 +68,7 @@ func NewRecordingRule(qb datasource.QuerierBuilder, group *Group, cfg config.Rul
 		Labels:    cfg.Labels,
 		GroupID:   group.ID(),
 		GroupName: group.Name,
+		GroupAuthToken: group.AuthToken,
 		File:      group.File,
 		metrics:   &recordingRuleMetrics{},
 		q: qb.BuildWithParams(datasource.QuerierParams{
@@ -102,7 +110,7 @@ func (rr *RecordingRule) close() {
 // It doesn't update internal states of the Rule and meant to be used just
 // to get time series for backfilling.
 func (rr *RecordingRule) execRange(ctx context.Context, start, end time.Time) ([]prompbmarshal.TimeSeries, error) {
-	res, err := rr.q.QueryRange(ctx, rr.Expr, start, end)
+	res, err := rr.q.QueryRange(ctx, rr.Expr, start, end, rr.GroupAuthToken)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +131,7 @@ func (rr *RecordingRule) execRange(ctx context.Context, start, end time.Time) ([
 // exec executes RecordingRule expression via the given Querier.
 func (rr *RecordingRule) exec(ctx context.Context, ts time.Time, limit int) ([]prompbmarshal.TimeSeries, error) {
 	start := time.Now()
-	res, req, err := rr.q.Query(ctx, rr.Expr, ts)
+	res, req, err := rr.q.Query(ctx, rr.Expr, ts, rr.GroupAuthToken)
 	curState := StateEntry{
 		Time:          start,
 		At:            ts,

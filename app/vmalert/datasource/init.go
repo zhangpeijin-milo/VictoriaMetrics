@@ -3,15 +3,15 @@ package datasource
 import (
 	"flag"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httputils"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
 
 var (
@@ -61,6 +61,9 @@ var (
 		`If true, disables HTTP keep-alives and will only use the connection to the server for a single HTTP request.`)
 	roundDigits = flag.Int("datasource.roundDigits", 0, `Adds "round_digits" GET param to datasource requests. `+
 		`In VM "round_digits" limits the number of digits after the decimal point in response values.`)
+	Suffix           string
+	BaseURL          string
+	DefaultAuthToken *auth.Token
 )
 
 // InitSecretFlags must be called after flag.Parse and before any logging
@@ -92,6 +95,14 @@ func Init(extraParams url.Values) (QuerierBuilder, error) {
 	}
 	if *lookBack != 0 {
 		logger.Warnf("flag `-datasource.lookback` will be deprecated soon. Please use `-rule.evalDelay` command-line flag instead. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/5155 for details.")
+	}
+
+	var err error
+	BaseURL, Suffix, DefaultAuthToken, err = utils.ParseURL(*addr)
+	if err != nil {
+		return nil, fmt.Errorf("wrong format of datasource.url: %v", *addr)
+	} else {
+		logger.Infof("DEBUG BaseURL = %s, Suffix = %s, DefaultAuthToken = [%d:%d]", BaseURL, Suffix, DefaultAuthToken.AccountID, DefaultAuthToken.ProjectID)
 	}
 
 	tr, err := httputils.Transport(*addr, *tlsCertFile, *tlsKeyFile, *tlsCAFile, *tlsServerName, *tlsInsecureSkipVerify)
@@ -131,7 +142,8 @@ func Init(extraParams url.Values) (QuerierBuilder, error) {
 	return &VMStorage{
 		c:                &http.Client{Transport: tr},
 		authCfg:          authCfg,
-		datasourceURL:    strings.TrimSuffix(*addr, "/"),
+		baseURL:          BaseURL,
+		suffix:           Suffix,
 		appendTypePrefix: *appendTypePrefix,
 		lookBack:         *lookBack,
 		queryStep:        *queryStep,

@@ -3,6 +3,7 @@ package datasource
 import (
 	"bytes"
 	"context"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"net/http"
 	"net/url"
 	"sort"
@@ -16,11 +17,11 @@ type Querier interface {
 	// It returns list of Metric in response, the http.Request used for sending query
 	// and error if any. Returned http.Request can't be reused and its body is already read.
 	// Query should stop once ctx is cancelled.
-	Query(ctx context.Context, query string, ts time.Time) (Result, *http.Request, error)
+	Query(ctx context.Context, query string, ts time.Time, at *auth.Token) (Result, *http.Request, error)
 	// QueryRange executes range request with the given query on the given time range.
 	// It returns list of Metric in response and error if any.
 	// QueryRange should stop once ctx is cancelled.
-	QueryRange(ctx context.Context, query string, from, to time.Time) (Result, error)
+	QueryRange(ctx context.Context, query string, from, to time.Time, at *auth.Token) (Result, error)
 }
 
 // Result represents expected response from the datasource

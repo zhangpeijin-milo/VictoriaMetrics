@@ -3,6 +3,7 @@ package rule
 import (
 	"context"
 	"fmt"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"hash/fnv"
 	"sort"
 	"strings"
@@ -30,6 +31,7 @@ type AlertingRule struct {
 	Annotations   map[string]string
 	GroupID       uint64
 	GroupName     string
+	GroupAuthToken *auth.Token
 	File          string
 	EvalInterval  time.Duration
 	Debug         bool
@@ -45,6 +47,11 @@ type AlertingRule struct {
 	state *ruleState
 
 	metrics *alertingRuleMetrics
+}
+
+// AuthToken returns the auth token of the alerting rule
+func (ar *AlertingRule) AuthToken() *auth.Token {
+	return ar.GroupAuthToken
 }
 
 type alertingRuleMetrics struct {
@@ -68,6 +75,7 @@ func NewAlertingRule(qb datasource.QuerierBuilder, group *Group, cfg config.Rule
 		Annotations:   cfg.Annotations,
 		GroupID:       group.ID(),
 		GroupName:     group.Name,
+		GroupAuthToken: group.AuthToken,
 		File:          group.File,
 		EvalInterval:  group.Interval,
 		Debug:         cfg.Debug,
@@ -304,7 +312,7 @@ func (ar *AlertingRule) toLabels(m datasource.Metric, qFn templates.QueryFn) (*l
 // It is not thread safe.
 // It returns ALERT and ALERT_FOR_STATE time series as a result.
 func (ar *AlertingRule) execRange(ctx context.Context, start, end time.Time) ([]prompbmarshal.TimeSeries, error) {
-	res, err := ar.q.QueryRange(ctx, ar.Expr, start, end)
+	res, err := ar.q.QueryRange(ctx, ar.Expr, start, end, ar.GroupAuthToken)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +376,7 @@ const resolvedRetention = 15 * time.Minute
 // Based on the Querier results AlertingRule maintains notifier.Alerts
 func (ar *AlertingRule) exec(ctx context.Context, ts time.Time, limit int) ([]prompbmarshal.TimeSeries, error) {
 	start := time.Now()
-	res, req, err := ar.q.Query(ctx, ar.Expr, ts)
+	res, req, err := ar.q.Query(ctx, ar.Expr, ts, ar.GroupAuthToken)
 	curState := StateEntry{
 		Time:          start,
 		At:            ts,
@@ -404,7 +412,7 @@ func (ar *AlertingRule) exec(ctx context.Context, ts time.Time, limit int) ([]pr
 	}
 
 	qFn := func(query string) ([]datasource.Metric, error) {
-		res, _, err := ar.q.Query(ctx, query, ts)
+		res, _, err := ar.q.Query(ctx, query, ts, ar.GroupAuthToken)
 		return res.Data, err
 	}
 	updated := make(map[uint64]struct{})
@@ -599,7 +607,7 @@ func alertForToTimeSeries(a *notifier.Alert, timestamp int64) prompbmarshal.Time
 // restore restores the value of ActiveAt field for active alerts,
 // based on previously written time series `alertForStateMetricName`.
 // Only rules with For > 0 can be restored.
-func (ar *AlertingRule) restore(ctx context.Context, q datasource.Querier, ts time.Time, lookback time.Duration) error {
+func (ar *AlertingRule) restore(ctx context.Context, q datasource.Querier, ts time.Time, lookback time.Duration, token *auth.Token) error {
 	if ar.For < 1 {
 		return nil
 	}
@@ -622,7 +630,7 @@ func (ar *AlertingRule) restore(ctx context.Context, q datasource.Querier, ts ti
 	expr := fmt.Sprintf("last_over_time(%s{%s%s}[%ds])",
 		alertForStateMetricName, nameStr, labelsFilter, int(lookback.Seconds()))
 
-	res, _, err := q.Query(ctx, expr, ts)
+	res, _, err := q.Query(ctx, expr, ts, ar.GroupAuthToken)
 	if err != nil {
 		return fmt.Errorf("failed to execute restore query %q: %w ", expr, err)
 	}
